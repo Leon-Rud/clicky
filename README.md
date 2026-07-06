@@ -19,6 +19,24 @@ Here's the [original tweet](https://x.com/FarzaTV/status/2041314633978659092) th
 
 This is the open-source version of Clicky for those that want to hack on it, build their own features, or just see how it works under the hood.
 
+## Fork setup (this branch)
+
+This fork (`subscription-fork`) strips out every third-party service except Anthropic:
+
+- **Claude** — the app calls `https://api.anthropic.com/v1/messages` directly. No Cloudflare Worker.
+- **Speech-to-text** — Apple's on-device SpeechAnalyzer/SpeechTranscriber (macOS 26 "Tahoe"+, falls back to SFSpeechRecognizer on older systems). No AssemblyAI.
+- **Text-to-speech** — Apple's AVSpeechSynthesizer. No ElevenLabs. (Tip: install a premium voice under System Settings → Accessibility → Spoken Content for much nicer output.)
+
+The only prerequisite is an **Anthropic API key**: create one at [console.anthropic.com](https://console.anthropic.com) — if you're on a Claude plan, this can draw from the Agent SDK credits included with your subscription, so there's nothing extra to pay for typical usage.
+
+Setup:
+
+1. `open leanring-buddy.xcodeproj`, set your signing team, and hit **Cmd + R** (target macOS 26).
+2. Click the Clicky icon in the menu bar and paste your API key into the **Anthropic API Key** field. It's stored in `UserDefaults` under the key `AnthropicAPIKey` (you can also set it from a terminal: `defaults write <your-bundle-id> AnthropicAPIKey "sk-ant-..."`).
+3. Grant the permissions the panel asks for. That's it — no Worker to deploy, no other keys.
+
+> The Cloudflare Worker instructions below are for the original upstream app and are not needed on this branch.
+
 ## Get started with Claude Code
 
 The fastest way to get this running is with [Claude Code](https://docs.anthropic.com/en/docs/claude-code).
