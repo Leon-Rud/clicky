@@ -68,16 +68,12 @@ final class CompanionManager: ObservableObject {
     // Response text is now displayed inline on the cursor overlay via
     // streamingResponseText, so no separate response overlay manager is needed.
 
-    /// Base URL for the Cloudflare Worker proxy. All API requests route
-    /// through this so keys never ship in the app binary.
-    private static let workerBaseURL = "https://your-worker-name.your-subdomain.workers.dev"
-
     private lazy var claudeAPI: ClaudeAPI = {
-        return ClaudeAPI(proxyURL: "\(Self.workerBaseURL)/chat", model: selectedModel)
+        return ClaudeAPI(model: selectedModel)
     }()
 
     private lazy var elevenLabsTTSClient: ElevenLabsTTSClient = {
-        return ElevenLabsTTSClient(proxyURL: "\(Self.workerBaseURL)/tts")
+        return ElevenLabsTTSClient(proxyURL: "https://your-worker-name.your-subdomain.workers.dev/tts")
     }()
 
     /// Conversation history so Claude remembers prior exchanges within a session.
@@ -114,6 +110,20 @@ final class CompanionManager: ObservableObject {
         selectedModel = model
         UserDefaults.standard.set(model, forKey: "selectedClaudeModel")
         claudeAPI.model = model
+    }
+
+    /// The user's Anthropic API key. Entered in the panel, persisted to
+    /// UserDefaults ("AnthropicAPIKey"), and read by ClaudeAPI on each request.
+    @Published var anthropicAPIKey: String = AnthropicAPIKeyStore.apiKey ?? ""
+
+    /// Whether an API key has been entered — the app can't respond without one.
+    var hasAnthropicAPIKey: Bool {
+        !anthropicAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    func setAnthropicAPIKey(_ apiKey: String) {
+        anthropicAPIKey = apiKey
+        AnthropicAPIKeyStore.setAPIKey(apiKey)
     }
 
     /// User preference for whether the Clicky cursor should be shown.
@@ -755,11 +765,13 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    /// Speaks a hardcoded error message using macOS system TTS when API
-    /// credits run out. Uses NSSpeechSynthesizer so it works even when
-    /// ElevenLabs is down.
+    /// Speaks a hardcoded error message using macOS system TTS when the
+    /// Anthropic request fails. Uses NSSpeechSynthesizer so it works even
+    /// when the primary TTS path is unavailable.
     private func speakCreditsErrorFallback() {
-        let utterance = "I'm all out of credits. Please DM Farza and tell him to bring me back to life."
+        let utterance = hasAnthropicAPIKey
+            ? "Something went wrong talking to Claude. Check that your API key is valid and has credits."
+            : "I need an Anthropic API key to work. Open the Clicky panel in the menu bar and paste one in."
         let synthesizer = NSSpeechSynthesizer()
         synthesizer.startSpeaking(utterance)
         voiceState = .responding

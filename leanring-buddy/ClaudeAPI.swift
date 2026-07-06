@@ -5,17 +5,41 @@
 
 import Foundation
 
+/// Reads and writes the user-supplied Anthropic API key. The key is entered
+/// in the menu bar panel and persisted to UserDefaults — no proxy server is
+/// involved, the app talks to api.anthropic.com directly.
+enum AnthropicAPIKeyStore {
+    static let userDefaultsKey = "AnthropicAPIKey"
+
+    static var apiKey: String? {
+        let storedValue = UserDefaults.standard.string(forKey: userDefaultsKey)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let storedValue, !storedValue.isEmpty else { return nil }
+        return storedValue
+    }
+
+    static func setAPIKey(_ apiKey: String) {
+        let trimmedKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        UserDefaults.standard.set(trimmedKey, forKey: userDefaultsKey)
+    }
+}
+
 /// Claude API helper with streaming for progressive text display.
+/// Talks to the Anthropic API directly using the key from AnthropicAPIKeyStore.
 class ClaudeAPI {
     private static let tlsWarmupLock = NSLock()
     private static var hasStartedTLSWarmup = false
+
+    /// The Anthropic Messages API endpoint.
+    private static let anthropicMessagesURLString = "https://api.anthropic.com/v1/messages"
+    private static let anthropicAPIVersion = "2023-06-01"
 
     private let apiURL: URL
     var model: String
     private let session: URLSession
 
-    init(proxyURL: String, model: String = "claude-sonnet-4-6") {
-        self.apiURL = URL(string: proxyURL)!
+    init(model: String = "claude-sonnet-4-6") {
+        self.apiURL = URL(string: Self.anthropicMessagesURLString)!
         self.model = model
 
         // Use .default instead of .ephemeral so TLS session tickets are cached.
@@ -36,11 +60,21 @@ class ClaudeAPI {
         warmUpTLSConnectionIfNeeded()
     }
 
-    private func makeAPIRequest() -> URLRequest {
+    private func makeAPIRequest() throws -> URLRequest {
+        guard let apiKey = AnthropicAPIKeyStore.apiKey else {
+            throw NSError(
+                domain: "ClaudeAPI",
+                code: 401,
+                userInfo: [NSLocalizedDescriptionKey: "No Anthropic API key set. Open the Clicky menu bar panel and paste your key from console.anthropic.com."]
+            )
+        }
+
         var request = URLRequest(url: apiURL)
         request.httpMethod = "POST"
         request.timeoutInterval = 120
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+        request.setValue(Self.anthropicAPIVersion, forHTTPHeaderField: "anthropic-version")
         return request
     }
 
@@ -107,7 +141,7 @@ class ClaudeAPI {
     ) async throws -> (text: String, duration: TimeInterval) {
         let startTime = Date()
 
-        var request = makeAPIRequest()
+        var request = try makeAPIRequest()
 
         // Build messages array
         var messages: [[String: Any]] = []
@@ -220,7 +254,7 @@ class ClaudeAPI {
     ) async throws -> (text: String, duration: TimeInterval) {
         let startTime = Date()
 
-        var request = makeAPIRequest()
+        var request = try makeAPIRequest()
 
         var messages: [[String: Any]] = []
         for (userPlaceholder, assistantResponse) in conversationHistory {

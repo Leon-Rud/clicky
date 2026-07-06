@@ -25,6 +25,10 @@ struct CompanionPanelView: View {
                 .padding(.top, 16)
                 .padding(.horizontal, 16)
 
+            apiKeySection
+                .padding(.top, 12)
+                .padding(.horizontal, 16)
+
             if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
                 Spacer()
                     .frame(height: 12)
@@ -176,6 +180,53 @@ struct CompanionPanelView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    // MARK: - Anthropic API Key
+
+    /// Field for the user's Anthropic API key. The app calls the Anthropic
+    /// API directly, so this is the only credential Clicky needs.
+    private var apiKeySection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("ANTHROPIC API KEY")
+                    .font(.system(size: 10, weight: .semibold, design: .rounded))
+                    .foregroundColor(DS.Colors.textTertiary)
+
+                Spacer()
+
+                if !companionManager.hasAnthropicAPIKey {
+                    Text("Required")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundColor(Color(red: 0.9, green: 0.4, blue: 0.4))
+                }
+            }
+
+            SecureField("sk-ant-...", text: Binding(
+                get: { companionManager.anthropicAPIKey },
+                set: { companionManager.setAnthropicAPIKey($0) }
+            ))
+            .textFieldStyle(.plain)
+            .font(.system(size: 12))
+            .foregroundColor(DS.Colors.textPrimary)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(
+                RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
+                    .fill(Color.white.opacity(0.08))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
+                    .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
+            )
+
+            if !companionManager.hasAnthropicAPIKey {
+                Text("Paste a key from console.anthropic.com — Clicky talks to Claude directly.")
+                    .font(.system(size: 10))
+                    .foregroundColor(DS.Colors.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
     }
 
