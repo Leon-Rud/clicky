@@ -38,6 +38,15 @@ import { query } from "@anthropic-ai/claude-agent-sdk";
 const BRIDGE_HOST = "127.0.0.1";
 const BRIDGE_PORT = 8377;
 
+// The Swift app's model picker pins the model generation that existed when the
+// app was built. Upgrading here (instead of in Swift) avoids a rebuild, which
+// would invalidate the user's TCC permission grants. Remove an entry to opt a
+// model out of upgrading.
+const MODEL_UPGRADE_MAP = {
+    "claude-sonnet-4-6": "claude-sonnet-5",
+    "claude-opus-4-6": "claude-opus-4-8",
+};
+
 // Screenshots arrive as base64 image blocks and can be several megabytes each.
 const MAX_REQUEST_BODY_BYTES = 100 * 1024 * 1024;
 
@@ -708,6 +717,15 @@ const server = http.createServer(async (request, response) => {
                 error: { type: "invalid_request_error", message: bodyError.message },
             });
             return;
+        }
+
+        // The Swift app pins older model IDs; upgrade them to the current
+        // generation here so the app gets smarter answers without a rebuild
+        // (rebuilding would invalidate the user's TCC permission grants).
+        const upgradedModel = MODEL_UPGRADE_MAP[requestBody.model];
+        if (upgradedModel !== undefined) {
+            requestBody.__originalRequestedModel = requestBody.model;
+            requestBody.model = upgradedModel;
         }
 
         const chatRequestContext = {
