@@ -23,17 +23,26 @@ This is the open-source version of Clicky for those that want to hack on it, bui
 
 This fork (`subscription-fork`) strips out every third-party service except Anthropic:
 
-- **Claude** — the app calls `https://api.anthropic.com/v1/messages` directly. No Cloudflare Worker.
+- **Claude** — two modes, picked in the menu bar panel under **Claude Access** (stored in `UserDefaults` under `ClaudeBackendMode`):
+  - **Claude subscription (local bridge)** — the default, zero API cost. Requests go to a tiny local Node server (`local-bridge/`) that forwards them to the Claude Agent SDK, which authenticates via your existing Claude Code login and runs on your Claude subscription. No API key at all.
+  - **API key** — the fallback: the app calls `https://api.anthropic.com/v1/messages` directly with a pay-per-token key from [console.anthropic.com](https://console.anthropic.com).
 - **Speech-to-text** — Apple's on-device SpeechAnalyzer/SpeechTranscriber (macOS 26 "Tahoe"+, falls back to SFSpeechRecognizer on older systems). No AssemblyAI.
 - **Text-to-speech** — Apple's AVSpeechSynthesizer. No ElevenLabs. (Tip: install a premium voice under System Settings → Accessibility → Spoken Content for much nicer output.)
-
-The only prerequisite is an **Anthropic API key**: create one at [console.anthropic.com](https://console.anthropic.com) — if you're on a Claude plan, this can draw from the Agent SDK credits included with your subscription, so there's nothing extra to pay for typical usage.
 
 Setup:
 
 1. `open leanring-buddy.xcodeproj`, set your signing team, and hit **Cmd + R** (target macOS 26).
-2. Click the Clicky icon in the menu bar and paste your API key into the **Anthropic API Key** field. It's stored in `UserDefaults` under the key `AnthropicAPIKey` (you can also set it from a terminal: `defaults write <your-bundle-id> AnthropicAPIKey "sk-ant-..."`).
-3. Grant the permissions the panel asks for. That's it — no Worker to deploy, no other keys.
+2. **Subscription mode (default):** make sure [Claude Code](https://code.claude.com/docs) is installed and logged in on this Mac, then start the bridge and leave it running:
+
+   ```bash
+   cd local-bridge
+   npm install   # first time only
+   npm start
+   ```
+
+   See `local-bridge/README.md` for details.
+3. **API-key mode (fallback):** in the menu bar panel, switch **Claude Access** to **API key** and paste a key from console.anthropic.com. It's stored in `UserDefaults` under the key `AnthropicAPIKey` (you can also set it from a terminal: `defaults write <your-bundle-id> AnthropicAPIKey "sk-ant-..."`).
+4. Grant the permissions the panel asks for. That's it — no Worker to deploy, no other keys.
 
 > The Cloudflare Worker instructions below are for the original upstream app and are not needed on this branch.
 

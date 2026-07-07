@@ -14,7 +14,7 @@ All API keys live on a Cloudflare Worker proxy — nothing sensitive ships in th
 - **App Type**: Menu bar-only (`LSUIElement=true`), no dock icon or main window
 - **Framework**: SwiftUI (macOS native) with AppKit bridging for menu bar panel and cursor overlay
 - **Pattern**: MVVM with `@StateObject` / `@Published` state management
-- **AI Chat**: Claude (Sonnet 4.6 default, Opus 4.6 optional) via Cloudflare Worker proxy with SSE streaming
+- **AI Chat**: Claude (Sonnet 4.6 default, Opus 4.6 optional) with SSE streaming. Two backend modes selected in the panel ("ClaudeBackendMode" in UserDefaults): `subscription` (default) posts to a local bridge server at `http://127.0.0.1:8377/chat` (`local-bridge/server.js`, backed by the Claude Agent SDK and the user's Claude Code login), `apiKey` calls `https://api.anthropic.com/v1/messages` directly with a user-supplied key
 - **Speech-to-Text**: AssemblyAI real-time streaming (`u3-rt-pro` model) via websocket, with OpenAI and Apple Speech as fallbacks
 - **Text-to-Speech**: ElevenLabs (`eleven_flash_v2_5` model) via Cloudflare Worker proxy
 - **Screen Capture**: ScreenCaptureKit (macOS 14.2+), multi-monitor support
@@ -66,7 +66,8 @@ Worker vars: `ELEVENLABS_VOICE_ID`
 | `AppleSpeechTranscriptionProvider.swift` | ~147 | Local fallback transcription provider backed by Apple's Speech framework. |
 | `BuddyAudioConversionSupport.swift` | ~108 | Audio conversion helpers. Converts live mic buffers to PCM16 mono audio and builds WAV payloads for upload-based providers. |
 | `GlobalPushToTalkShortcutMonitor.swift` | ~132 | System-wide push-to-talk monitor. Owns the listen-only `CGEvent` tap and publishes press/release transitions. |
-| `ClaudeAPI.swift` | ~291 | Claude vision API client with streaming (SSE) and non-streaming modes. TLS warmup optimization, image MIME detection, conversation history support. |
+| `ClaudeAPI.swift` | ~412 | Claude vision API client with streaming (SSE) and non-streaming modes. Two backends: local subscription bridge (default) or direct Anthropic API with a user key (`ClaudeBackendModeStore` / `AnthropicAPIKeyStore`). TLS warmup optimization, image MIME detection, conversation history support. |
+| `local-bridge/server.js` | ~401 | Local Node bridge on 127.0.0.1:8377. Exposes an Anthropic-Messages-compatible `POST /chat` (SSE + JSON) backed by the Claude Agent SDK, so subscription mode needs no API key. `GET /health` for liveness. Run with `cd local-bridge && npm start`. |
 | `OpenAIAPI.swift` | ~142 | OpenAI GPT vision API client. |
 | `ElevenLabsTTSClient.swift` | ~81 | ElevenLabs TTS client. Sends text to the Worker proxy, plays back audio via `AVAudioPlayer`. Exposes `isPlaying` for transient cursor scheduling. |
 | `ElementLocationDetector.swift` | ~335 | Detects UI element locations in screenshots for cursor pointing. |
