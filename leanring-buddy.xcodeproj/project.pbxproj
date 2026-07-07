@@ -9,6 +9,7 @@
 /* Begin PBXBuildFile section */
 		AA00BB032F6500030039DA55 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = AA00BB022F6500020039DA55 /* Sparkle */; };
 		AA00BB062F6500060039DA55 /* PostHog in Frameworks */ = {isa = PBXBuildFile; productRef = AA00BB052F6500050039DA55 /* PostHog */; };
+		AA00BB092F6500090039DA55 /* FluidAudio in Frameworks */ = {isa = PBXBuildFile; productRef = AA00BB082F6500080039DA55 /* FluidAudio */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -59,6 +60,7 @@
 			files = (
 				AA00BB032F6500030039DA55 /* Sparkle in Frameworks */,
 				AA00BB062F6500060039DA55 /* PostHog in Frameworks */,
+				AA00BB092F6500090039DA55 /* FluidAudio in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -121,6 +123,7 @@
 			packageProductDependencies = (
 				AA00BB022F6500020039DA55 /* Sparkle */,
 				AA00BB052F6500050039DA55 /* PostHog */,
+				AA00BB082F6500080039DA55 /* FluidAudio */,
 			);
 			productName = "leanring-buddy";
 			productReference = 28F22CBF2F56440300A0FC59 /* Clicky.app */;
@@ -207,6 +210,7 @@
 			packageReferences = (
 				AA00BB012F6500010039DA55 /* XCRemoteSwiftPackageReference "Sparkle" */,
 				AA00BB042F6500040039DA55 /* XCRemoteSwiftPackageReference "posthog-ios" */,
+				AA00BB072F6500070039DA55 /* XCRemoteSwiftPackageReference "FluidAudio" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 28F22CC02F56440300A0FC59 /* Products */;
@@ -616,6 +620,14 @@
 				minimumVersion = 3.0.0;
 			};
 		};
+		AA00BB072F6500070039DA55 /* XCRemoteSwiftPackageReference "FluidAudio" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/FluidInference/FluidAudio.git";
+			requirement = {
+				kind = upToNextMinorVersion;
+				minimumVersion = 0.15.4;
+			};
+		};
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
@@ -628,6 +640,11 @@
 			isa = XCSwiftPackageProductDependency;
 			package = AA00BB042F6500040039DA55 /* XCRemoteSwiftPackageReference "posthog-ios" */;
 			productName = PostHog;
+		};
+		AA00BB082F6500080039DA55 /* FluidAudio */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = AA00BB072F6500070039DA55 /* XCRemoteSwiftPackageReference "FluidAudio" */;
+			productName = FluidAudio;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

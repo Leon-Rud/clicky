@@ -78,6 +78,14 @@ final class CompanionManager: ObservableObject {
         return AppleTTSClient()
     }()
 
+    /// On-device neural text-to-speech via the Kokoro-82M model (FluidAudio
+    /// package, CoreML on the Neural Engine). Preferred voice when the
+    /// "PreferKokoroVoice" setting is on; appleTTSClient is the fallback
+    /// whenever Kokoro isn't ready or fails.
+    private lazy var kokoroTTSClient: KokoroTTSClient = {
+        return KokoroTTSClient()
+    }()
+
     /// Conversation history so Claude remembers prior exchanges within a session.
     /// Each entry is the user's transcript and Claude's response.
     private var conversationHistory: [(userTranscript: String, assistantResponse: String)] = []
@@ -161,6 +169,26 @@ final class CompanionManager: ObservableObject {
         }
     }
 
+    /// User preference for the response voice: Kokoro's on-device neural
+    /// voice (default) or the Apple system voice. Persisted to UserDefaults
+    /// ("PreferKokoroVoice"). When Kokoro can't speak an utterance (models
+    /// still downloading, synthesis error), the app falls back to the Apple
+    /// system voice for that utterance instead of staying silent.
+    @Published var preferKokoroVoice: Bool = UserDefaults.standard.object(forKey: "PreferKokoroVoice") == nil
+        ? true
+        : UserDefaults.standard.bool(forKey: "PreferKokoroVoice")
+
+    func setPreferKokoroVoice(_ preferKokoroVoice: Bool) {
+        self.preferKokoroVoice = preferKokoroVoice
+        UserDefaults.standard.set(preferKokoroVoice, forKey: "PreferKokoroVoice")
+        if preferKokoroVoice {
+            // Warm the Kokoro models right away so switching voices doesn't
+            // leave the next few utterances on the fallback voice while the
+            // first-run download/compile finishes.
+            kokoroTTSClient.prepareModelsInBackground()
+        }
+    }
+
     /// Whether the user has completed onboarding at least once. Persisted
     /// to UserDefaults so the Start button only appears on first launch.
     var hasCompletedOnboarding: Bool {
@@ -204,6 +232,14 @@ final class CompanionManager: ObservableObject {
         // Eagerly touch the Claude API so its TLS warmup handshake completes
         // well before the onboarding demo fires at ~40s into the video.
         _ = claudeAPI
+
+        // Warm the Kokoro voice models at launch (first run downloads ~90 MB
+        // in the background) so the first spoken response can use the neural
+        // voice. Utterances spoken before the models are ready fall back to
+        // the Apple system voice.
+        if preferKokoroVoice {
+            kokoroTTSClient.prepareModelsInBackground()
+        }
 
         // If the user already completed onboarding AND all permissions are
         // still granted, show the cursor overlay immediately. If permissions
@@ -516,6 +552,7 @@ final class CompanionManager: ObservableObject {
             // Cancel any in-progress response and TTS from a previous utterance
             currentResponseTask?.cancel()
             appleTTSClient.stopPlayback()
+            kokoroTTSClient.stopPlayback()
             clearDetectedElementLocation()
 
             // Dismiss the onboarding prompt if it's showing
@@ -601,13 +638,15 @@ final class CompanionManager: ObservableObject {
     // MARK: - AI Response Pipeline
 
     /// Captures a screenshot, sends it along with the transcript to Claude,
-    /// and speaks the response aloud via Apple TTS. The cursor stays in
+    /// and speaks the response aloud via the preferred TTS voice (Kokoro by
+    /// default, Apple system voice as fallback). The cursor stays in
     /// the spinner/processing state until TTS audio begins playing.
     /// Claude's response may include a [POINT:x,y:label] tag which triggers
     /// the buddy to fly to that element on screen.
     private func sendTranscriptToClaudeWithScreenshot(transcript: String) {
         currentResponseTask?.cancel()
         appleTTSClient.stopPlayback()
+        kokoroTTSClient.stopPlayback()
 
         currentResponseTask = Task {
             // Stay in processing (spinner) state — no streaming text displayed
@@ -723,12 +762,12 @@ final class CompanionManager: ObservableObject {
                 // until the audio actually starts playing, then switch to responding.
                 if !spokenText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     do {
-                        try await appleTTSClient.speakText(spokenText)
-                        // speakText returns after player.play() — audio is now playing
+                        try await speakResponseText(spokenText)
+                        // speakResponseText returns once audio is playing
                         voiceState = .responding
                     } catch {
                         ClickyAnalytics.trackTTSError(error: error.localizedDescription)
-                        print("⚠️ Apple TTS error: \(error)")
+                        print("⚠️ TTS error: \(error)")
                         speakCreditsErrorFallback()
                     }
                 }
@@ -747,6 +786,24 @@ final class CompanionManager: ObservableObject {
         }
     }
 
+    /// Speaks a response using the preferred voice. Tries Kokoro first when
+    /// the "PreferKokoroVoice" setting is on, and falls back to the Apple
+    /// system voice if Kokoro fails for any reason (models still downloading
+    /// on first run, synthesis error) so the user always hears a response.
+    private func speakResponseText(_ spokenText: String) async throws {
+        if preferKokoroVoice {
+            do {
+                try await kokoroTTSClient.speakText(spokenText)
+                return
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                print("⚠️ Kokoro TTS unavailable (\(error.localizedDescription)) — falling back to Apple TTS for this utterance")
+            }
+        }
+        try await appleTTSClient.speakText(spokenText)
+    }
+
     /// If the cursor is in transient mode (user toggled "Show Clicky" off),
     /// waits for TTS playback and any pointing animation to finish, then
     /// fades out the overlay after a 1-second pause. Cancelled automatically
@@ -756,8 +813,8 @@ final class CompanionManager: ObservableObject {
 
         transientHideTask?.cancel()
         transientHideTask = Task {
-            // Wait for TTS audio to finish playing
-            while appleTTSClient.isPlaying {
+            // Wait for TTS audio to finish playing (whichever voice spoke)
+            while appleTTSClient.isPlaying || kokoroTTSClient.isPlaying {
                 try? await Task.sleep(nanoseconds: 200_000_000)
                 guard !Task.isCancelled else { return }
             }
