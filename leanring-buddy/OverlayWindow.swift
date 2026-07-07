@@ -575,6 +575,10 @@ struct BlueCursorView: View {
         // Rotate back to default pointer angle now that we've arrived
         triangleRotationDegrees = -35.0
 
+        // If Claude returned a [CLICK:...] tag for this element, the buddy has
+        // now arrived at the target — perform the real mouse click.
+        companionManager.performPendingClickAtPointedElementIfNeeded()
+
         // Reset navigation bubble state — start small for the scale-bounce entrance
         navigationBubbleText = ""
         navigationBubbleOpacity = 1.0

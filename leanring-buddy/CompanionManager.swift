@@ -71,6 +71,14 @@ final class CompanionManager: ObservableObject {
         return ClaudeAPI(model: selectedModel)
     }()
 
+    /// Precision second pass for pointing/click coordinates. Given the same
+    /// screenshot sent with the main request and the element label from a
+    /// [POINT:...]/[CLICK:...] tag, it asks Claude (via the local bridge) for
+    /// refined exact coordinates. Falls back to the tag coordinates on failure.
+    private lazy var elementLocationDetector: ElementLocationDetector = {
+        return ElementLocationDetector()
+    }()
+
     /// On-device text-to-speech via AVSpeechSynthesizer. Replaces the
     /// ElevenLabs client — no network, no API key.
     private lazy var appleTTSClient: AppleTTSClient = {
@@ -166,6 +174,29 @@ final class CompanionManager: ObservableObject {
             overlayWindowManager.hideOverlay()
             isOverlayVisible = false
         }
+    }
+
+    /// User preference for whether Clicky may perform real mouse clicks when
+    /// the user verbally asks for an action ("click the save button"). When
+    /// off, [CLICK:...] tags from Claude degrade to pointing-only behavior.
+    /// Persisted to UserDefaults ("AllowClickActions"), default true.
+    @Published var allowClickActions: Bool = UserDefaults.standard.object(forKey: "AllowClickActions") == nil
+        ? true
+        : UserDefaults.standard.bool(forKey: "AllowClickActions")
+
+    func setAllowClickActions(_ allowClickActions: Bool) {
+        self.allowClickActions = allowClickActions
+        UserDefaults.standard.set(allowClickActions, forKey: "AllowClickActions")
+    }
+
+    /// Whether POINT coordinates should also be refined through the locator
+    /// second pass ("PrecisePointing" in UserDefaults, default true). CLICK
+    /// coordinates are ALWAYS refined regardless of this flag — accuracy
+    /// matters more when performing a real click than when pointing.
+    private var isPrecisePointingEnabled: Bool {
+        UserDefaults.standard.object(forKey: "PrecisePointing") == nil
+            ? true
+            : UserDefaults.standard.bool(forKey: "PrecisePointing")
     }
 
     /// User preference for the response voice: Kokoro's on-device neural
@@ -337,6 +368,87 @@ final class CompanionManager: ObservableObject {
         detectedElementScreenLocation = nil
         detectedElementDisplayFrame = nil
         detectedElementBubbleText = nil
+        // Drop any click that never fired (animation cancelled, user spoke
+        // again) so a stale click can never land on whatever is on screen later.
+        pendingClickAction = nil
+        pendingClickFallbackTask?.cancel()
+        pendingClickFallbackTask = nil
+    }
+
+    // MARK: - Click Actions
+
+    /// A real mouse click waiting for the overlay cursor to arrive at the
+    /// target. Set when Claude returns a [CLICK:...] tag and the "Allow
+    /// actions" toggle is on; performed by the overlay when the flight
+    /// animation lands (see BlueCursorView.startPointingAtElement).
+    private struct PendingClickAction {
+        /// Where to click, in global AppKit screen coordinates (bottom-left origin).
+        let globalScreenLocation: CGPoint
+        /// Short element label from the tag, for logging.
+        let elementLabel: String
+    }
+
+    private var pendingClickAction: PendingClickAction?
+    /// Safety net: performs the pending click even if the overlay flight
+    /// animation never lands (e.g. it was blocked by the welcome animation).
+    private var pendingClickFallbackTask: Task<Void, Never>?
+
+    /// Called by BlueCursorView the moment the buddy arrives at the pointed
+    /// element, so the real click happens right when the animation lands.
+    func performPendingClickAtPointedElementIfNeeded() {
+        guard let clickAction = pendingClickAction else { return }
+        pendingClickAction = nil
+        pendingClickFallbackTask?.cancel()
+        pendingClickFallbackTask = nil
+        performSingleLeftClick(
+            atGlobalAppKitPoint: clickAction.globalScreenLocation,
+            elementLabel: clickAction.elementLabel
+        )
+    }
+
+    /// Synthesizes one left mouse click at the given global AppKit point via
+    /// CGEvent, then restores the user's real cursor to where it was. Only a
+    /// single left click is ever synthesized — no double clicks, drags, or
+    /// other buttons.
+    private func performSingleLeftClick(atGlobalAppKitPoint globalAppKitPoint: CGPoint, elementLabel: String) {
+        guard let primaryScreen = NSScreen.screens.first else { return }
+
+        // AppKit global coordinates have a bottom-left origin on the primary
+        // screen; CGEvent coordinates have a top-left origin on the primary
+        // screen. Only the Y axis flips — X is shared between the two spaces.
+        let clickPointInCGEventCoordinates = CGPoint(
+            x: globalAppKitPoint.x,
+            y: primaryScreen.frame.maxY - globalAppKitPoint.y
+        )
+
+        // Remember where the user's real cursor is so it can be put back —
+        // the synthesized click warps the cursor to the click point.
+        let originalCursorPositionInCGEventCoordinates = CGEvent(source: nil)?.location
+
+        guard let mouseDownEvent = CGEvent(
+                  mouseEventSource: nil,
+                  mouseType: .leftMouseDown,
+                  mouseCursorPosition: clickPointInCGEventCoordinates,
+                  mouseButton: .left
+              ),
+              let mouseUpEvent = CGEvent(
+                  mouseEventSource: nil,
+                  mouseType: .leftMouseUp,
+                  mouseCursorPosition: clickPointInCGEventCoordinates,
+                  mouseButton: .left
+              ) else {
+            print("⚠️ Click action: failed to create CGEvents for \"\(elementLabel)\"")
+            return
+        }
+
+        mouseDownEvent.post(tap: .cghidEventTap)
+        mouseUpEvent.post(tap: .cghidEventTap)
+
+        if let originalCursorPositionInCGEventCoordinates {
+            CGWarpMouseCursorPosition(originalCursorPositionInCGEventCoordinates)
+        }
+
+        print("🖱️ Click action: clicked \"\(elementLabel)\" at (\(Int(globalAppKitPoint.x)), \(Int(globalAppKitPoint.y))) global AppKit coords")
     }
 
     func stop() {
@@ -622,11 +734,22 @@ final class CompanionManager: ObservableObject {
 
     if pointing wouldn't help, append [POINT:none].
 
+    click actions:
+    you can also perform a REAL mouse click for the user. emit a CLICK tag ONLY when the user's request is explicitly an action command — they ask you to click, press, open, or select something FOR them ("click the save button", "open that menu", "select the first result", "press submit for me"). for informational questions ("where is the save button?", "how do i open settings?") use POINT as before, never CLICK. when in doubt, use POINT — a wrong click is worse than a wrong point.
+
+    strict CLICK rules:
+    - format: [CLICK:x,y:label] — or [CLICK:x,y:label:screenN] if the element is on a different screen than the cursor. same coordinate space rules as POINT.
+    - never emit both a POINT tag and a CLICK tag in the same response — exactly one tag, and it must be the very last thing in your response.
+    - when you emit CLICK, keep the spoken text to a brief confirmation of the action, like "clicking the save button."
+
     examples:
     - user asks how to color grade in final cut: "you'll want to open the color inspector — it's right up in the top right area of the toolbar. click that and you'll get all the color wheels and curves. [POINT:1100,42:color inspector]"
     - user asks what html is: "html stands for hypertext markup language, it's basically the skeleton of every web page. curious how it connects to the css you're looking at? [POINT:none]"
     - user asks how to commit in xcode: "see that source control menu up top? click that and hit commit, or you can use command option c as a shortcut. [POINT:285,11:source control]"
     - element is on screen 2 (not where cursor is): "that's over on your other monitor — see the terminal window? [POINT:400,300:terminal:screen2]"
+    - user says "click the save button": "clicking the save button. [CLICK:640,52:save button]"
+    - user says "where's the save button?" (informational, so POINT not CLICK): "it's up in the top right of the toolbar. [POINT:640,52:save button]"
+    - user says "open the file menu for me": "opening the file menu. [CLICK:85,11:file menu]"
     """
 
     // MARK: - AI Response Pipeline
@@ -677,18 +800,13 @@ final class CompanionManager: ObservableObject {
 
                 guard !Task.isCancelled else { return }
 
-                // Parse the [POINT:...] tag from Claude's response
+                // Parse the [POINT:...] / [CLICK:...] tag from Claude's response
                 let parseResult = Self.parsePointingCoordinates(from: fullResponseText)
                 let spokenText = parseResult.spokenText
 
-                // Handle element pointing if Claude returned coordinates.
-                // Switch to idle BEFORE setting the location so the triangle
-                // becomes visible and can fly to the target. Without this, the
-                // spinner hides the triangle and the flight animation is invisible.
-                let hasPointCoordinate = parseResult.coordinate != nil
-                if hasPointCoordinate {
-                    voiceState = .idle
-                }
+                // A CLICK tag only performs a real click when the "Allow
+                // actions" toggle is on — otherwise it degrades to pointing.
+                let shouldPerformClickAction = parseResult.isClickAction && allowClickActions
 
                 // Pick the screen capture matching Claude's screen number,
                 // falling back to the cursor screen if not specified.
@@ -700,10 +818,36 @@ final class CompanionManager: ObservableObject {
                     return screenCaptures.first(where: { $0.isCursorScreen })
                 }()
 
-                if let pointCoordinate = parseResult.coordinate,
+                if var pointCoordinate = parseResult.coordinate,
                    let targetScreenCapture {
+                    // Precision second pass: re-ask Claude (via the locator)
+                    // for exact coordinates using the SAME screenshot. Always
+                    // refine before clicking — a real click must be accurate.
+                    // For pointing, refine only when "PrecisePointing" is on.
+                    // Only meaningful in subscription mode — the locator talks
+                    // to the local bridge, which API-key users don't run.
+                    let shouldRefineCoordinate = (shouldPerformClickAction || isPrecisePointingEnabled)
+                        && claudeBackendMode == .subscription
+                    if shouldRefineCoordinate, let elementLabel = parseResult.elementLabel {
+                        if let refinedCoordinate = await elementLocationDetector.refineElementCoordinate(
+                            screenshotData: targetScreenCapture.imageData,
+                            screenshotWidthInPixels: targetScreenCapture.screenshotWidthInPixels,
+                            screenshotHeightInPixels: targetScreenCapture.screenshotHeightInPixels,
+                            elementLabel: elementLabel,
+                            initialCoordinate: pointCoordinate
+                        ) {
+                            pointCoordinate = refinedCoordinate
+                        }
+                        guard !Task.isCancelled else { return }
+                    }
+
+                    // Switch to idle BEFORE setting the location so the triangle
+                    // becomes visible and can fly to the target. Without this, the
+                    // spinner hides the triangle and the flight animation is invisible.
+                    voiceState = .idle
+
                     // Claude's coordinates are in the screenshot's pixel space
-                    // (top-left origin, e.g. 1280x831). Scale to the display's
+                    // (top-left origin, e.g. 1568x980). Scale to the display's
                     // point space (e.g. 1512x982), then convert to AppKit global coords.
                     let screenshotWidth = CGFloat(targetScreenCapture.screenshotWidthInPixels)
                     let screenshotHeight = CGFloat(targetScreenCapture.screenshotHeightInPixels)
@@ -728,10 +872,36 @@ final class CompanionManager: ObservableObject {
                         y: appKitY + displayFrame.origin.y
                     )
 
+                    if shouldPerformClickAction {
+                        // Safety: only click a point that actually lies on a
+                        // connected screen — never synthesize an off-screen click.
+                        let clickTargetIsOnAScreen = NSScreen.screens.contains { screen in
+                            screen.frame.contains(globalLocation)
+                        }
+                        if clickTargetIsOnAScreen {
+                            // The overlay performs the click when the flight
+                            // animation lands on the target (so the user sees the
+                            // buddy arrive first). The fallback fires it anyway if
+                            // the animation never lands — flights max out at 1.4s.
+                            pendingClickAction = PendingClickAction(
+                                globalScreenLocation: globalLocation,
+                                elementLabel: parseResult.elementLabel ?? "element"
+                            )
+                            pendingClickFallbackTask?.cancel()
+                            pendingClickFallbackTask = Task { [weak self] in
+                                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                                guard !Task.isCancelled else { return }
+                                self?.performPendingClickAtPointedElementIfNeeded()
+                            }
+                        } else {
+                            print("⚠️ Click action: target (\(Int(globalLocation.x)), \(Int(globalLocation.y))) is outside every screen — pointing only")
+                        }
+                    }
+
                     detectedElementScreenLocation = globalLocation
                     detectedElementDisplayFrame = displayFrame
                     ClickyAnalytics.trackElementPointed(elementLabel: parseResult.elementLabel)
-                    print("🎯 Element pointing: (\(Int(pointCoordinate.x)), \(Int(pointCoordinate.y))) → \"\(parseResult.elementLabel ?? "element")\"")
+                    print("🎯 Element \(shouldPerformClickAction ? "click" : "pointing"): (\(Int(pointCoordinate.x)), \(Int(pointCoordinate.y))) → \"\(parseResult.elementLabel ?? "element")\"")
                 } else {
                     print("🎯 Element pointing: \(parseResult.elementLabel ?? "no element")")
                 }
@@ -855,11 +1025,11 @@ final class CompanionManager: ObservableObject {
         voiceState = .responding
     }
 
-    // MARK: - Point Tag Parsing
+    // MARK: - Point/Click Tag Parsing
 
-    /// Result of parsing a [POINT:...] tag from Claude's response.
+    /// Result of parsing a [POINT:...] or [CLICK:...] tag from Claude's response.
     struct PointingParseResult {
-        /// The response text with the [POINT:...] tag removed — this is what gets spoken.
+        /// The response text with the tag removed — this is what gets spoken.
         let spokenText: String
         /// The parsed pixel coordinate, or nil if Claude said "none" or no tag was found.
         let coordinate: CGPoint?
@@ -867,40 +1037,51 @@ final class CompanionManager: ObservableObject {
         let elementLabel: String?
         /// Which screen the coordinate refers to (1-based), or nil to default to cursor screen.
         let screenNumber: Int?
+        /// True when the tag was [CLICK:...] — the user asked for a real click,
+        /// not just pointing. Whether the click actually happens also depends
+        /// on the "Allow actions" toggle.
+        let isClickAction: Bool
     }
 
-    /// Parses a [POINT:x,y:label:screenN] or [POINT:none] tag from the end of Claude's response.
-    /// Returns the spoken text (tag removed) and the optional coordinate + label + screen number.
+    /// Parses a [POINT:x,y:label:screenN], [CLICK:x,y:label:screenN], or
+    /// [POINT:none] tag from the end of Claude's response. Returns the spoken
+    /// text (tag removed) plus the optional coordinate + label + screen number,
+    /// and whether the tag requests a real click.
     static func parsePointingCoordinates(from responseText: String) -> PointingParseResult {
-        // Match [POINT:none] or [POINT:123,456:label] or [POINT:123,456:label:screen2]
-        let pattern = #"\[POINT:(?:none|(\d+)\s*,\s*(\d+)(?::([^\]:\s][^\]:]*?))?(?::screen(\d+))?)\]\s*$"#
+        // Match [POINT:none] / [POINT:123,456:label(:screen2)] / [CLICK:123,456:label(:screen2)]
+        let pattern = #"\[(POINT|CLICK):(?:none|(\d+)\s*,\s*(\d+)(?::([^\]:\s][^\]:]*?))?(?::screen(\d+))?)\]\s*$"#
 
         guard let regex = try? NSRegularExpression(pattern: pattern, options: []),
               let match = regex.firstMatch(in: responseText, range: NSRange(responseText.startIndex..., in: responseText)) else {
             // No tag found at all
-            return PointingParseResult(spokenText: responseText, coordinate: nil, elementLabel: nil, screenNumber: nil)
+            return PointingParseResult(spokenText: responseText, coordinate: nil, elementLabel: nil, screenNumber: nil, isClickAction: false)
         }
 
         // Remove the tag from the spoken text
         let tagRange = Range(match.range, in: responseText)!
         let spokenText = String(responseText[..<tagRange.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
 
-        // Check if it's [POINT:none]
-        guard match.numberOfRanges >= 3,
-              let xRange = Range(match.range(at: 1), in: responseText),
-              let yRange = Range(match.range(at: 2), in: responseText),
+        var isClickAction = false
+        if let tagKindRange = Range(match.range(at: 1), in: responseText) {
+            isClickAction = responseText[tagKindRange] == "CLICK"
+        }
+
+        // Check if it's [POINT:none] (or a malformed coordinate)
+        guard match.numberOfRanges >= 4,
+              let xRange = Range(match.range(at: 2), in: responseText),
+              let yRange = Range(match.range(at: 3), in: responseText),
               let x = Double(responseText[xRange]),
               let y = Double(responseText[yRange]) else {
-            return PointingParseResult(spokenText: spokenText, coordinate: nil, elementLabel: "none", screenNumber: nil)
+            return PointingParseResult(spokenText: spokenText, coordinate: nil, elementLabel: "none", screenNumber: nil, isClickAction: false)
         }
 
         var elementLabel: String? = nil
-        if match.numberOfRanges >= 4, let labelRange = Range(match.range(at: 3), in: responseText) {
+        if match.numberOfRanges >= 5, let labelRange = Range(match.range(at: 4), in: responseText) {
             elementLabel = String(responseText[labelRange]).trimmingCharacters(in: .whitespaces)
         }
 
         var screenNumber: Int? = nil
-        if match.numberOfRanges >= 5, let screenRange = Range(match.range(at: 4), in: responseText) {
+        if match.numberOfRanges >= 6, let screenRange = Range(match.range(at: 5), in: responseText) {
             screenNumber = Int(responseText[screenRange])
         }
 
@@ -908,7 +1089,8 @@ final class CompanionManager: ObservableObject {
             spokenText: spokenText,
             coordinate: CGPoint(x: x, y: y),
             elementLabel: elementLabel,
-            screenNumber: screenNumber
+            screenNumber: screenNumber,
+            isClickAction: isClickAction
         )
     }
 

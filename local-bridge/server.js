@@ -156,6 +156,10 @@ const POINTING_REMINDER_TEXT =
     "where x,y are integer pixel coordinates in the labeled screenshot's coordinate space (origin top-left) " +
     "and label is a short 1-3 word element name. err on the side of pointing. " +
     "if pointing genuinely wouldn't help, end with [POINT:none] instead. " +
+    "if — and ONLY if — the user's request is explicitly an action command (they ask you to click, press, " +
+    "open, or select something FOR them), use [CLICK:x,y:label] (or [CLICK:x,y:label:screenN]) instead of " +
+    "POINT, and keep the spoken text to a brief confirmation like \"clicking the save button.\" " +
+    "for informational questions always use POINT, and never emit both a POINT and a CLICK tag. " +
     "the tag must be the very last thing in your response, after all spoken text.\n" +
     "</pointing_reminder>";
 
@@ -272,13 +276,21 @@ function buildAgentSDKOptions(requestBody, abortController) {
         environmentForClaudeCode.CLAUDE_CODE_MAX_OUTPUT_TOKENS = String(requestBody.max_tokens);
     }
 
+    const systemPromptText = extractSystemPromptText(requestBody.system);
+    // Locator requests (ElementLocationDetector.swift's precision coordinate
+    // pass) demand a strict-JSON answer, so the spoken-voice style instruction
+    // must NOT be appended — it would push the model back to prose.
+    const isLocatorRequest = systemPromptText.includes("<locator_request>");
+
     return {
         model: requestBody.model,
         // A plain string REPLACES Claude Code's preset system prompt entirely
         // (maximum fidelity) — this is NOT the `{type:'preset', append}` mode.
         // The voice-style instruction is appended AFTER the app's own prompt
         // so it never displaces the app's instructions (including pointing).
-        systemPrompt: extractSystemPromptText(requestBody.system) + VOICE_RESPONSE_STYLE_INSTRUCTION,
+        systemPrompt: isLocatorRequest
+            ? systemPromptText
+            : systemPromptText + VOICE_RESPONSE_STYLE_INSTRUCTION,
         // Pin extended thinking off. Clicky is a look-at-screenshot-and-answer
         // app where time-to-first-token matters more than deep reasoning. In
         // SDK mode Claude Code already defaults the thinking budget to 0, but
@@ -383,10 +395,14 @@ function replenishWarmAgentQuerySlot() {
 
 /// Returns an Agent SDK query for this request — the warm process when its
 /// options match, otherwise a cold spawn — plus that query's abort controller.
-function acquireAgentQueryForRequest(requestBody, sdkUserMessage) {
+///
+/// `mayUseWarmProcess: false` bypasses the warm slot entirely (never consumes
+/// or discards it). Used for non-streaming locator requests so they can't
+/// evict the warm process that the next voice request depends on.
+function acquireAgentQueryForRequest(requestBody, sdkUserMessage, mayUseWarmProcess = true) {
     const requestOptionsKey = computeWarmQueryKey(requestBody);
 
-    if (warmAgentQuerySlot !== null) {
+    if (mayUseWarmProcess && warmAgentQuerySlot !== null) {
         const warmSlot = warmAgentQuerySlot;
         const warmSlotAgeMs = Date.now() - warmSlot.createdAt;
         if (warmSlot.optionsKey === requestOptionsKey && warmSlotAgeMs < WARM_QUERY_MAX_AGE_MS) {
@@ -591,7 +607,7 @@ async function handleStreamingChat(response, requestBody, chatRequestContext) {
             } else if (!hasForwardedMessageStop) {
                 writeSSEEvent(response, { type: "message_stop" });
             }
-            const containsPointTag = /\[POINT:/.test(accumulatedAssistantText);
+            const containsPointTag = /\[(?:POINT|CLICK):/.test(accumulatedAssistantText);
             logBridgeEvent(
                 requestLogId,
                 `✅ ok in ${elapsedSecondsText(requestStartedAt)} ` +
@@ -645,7 +661,9 @@ async function handleNonStreamingChat(response, requestBody, chatRequestContext)
         let attemptErrorDescription = null;
 
         try {
-            const { agentQuery, abortController, wasWarm } = acquireAgentQueryForRequest(requestBody, sdkUserMessage);
+            // Non-streaming requests are locator calls — keep them away from
+            // the warm slot so the main voice flow's pre-spawned process survives.
+            const { agentQuery, abortController, wasWarm } = acquireAgentQueryForRequest(requestBody, sdkUserMessage, false);
             chatRequestContext.currentAbortController = abortController;
             logBridgeEvent(requestLogId, `attempt ${attemptNumber}/${maxAttemptCount} using ${wasWarm ? "warm" : "cold"} SDK process`);
 
@@ -694,7 +712,7 @@ async function handleNonStreamingChat(response, requestBody, chatRequestContext)
     logBridgeEvent(
         requestLogId,
         `✅ ok in ${elapsedSecondsText(requestStartedAt)} (${accumulatedAssistantText.length} chars, ` +
-            `point tag: ${/\[POINT:/.test(accumulatedAssistantText) ? "yes" : "no"})`
+            `point tag: ${/\[(?:POINT|CLICK):/.test(accumulatedAssistantText) ? "yes" : "no"})`
     );
     writeJSONResponse(response, 200, {
         id: `msg_bridge_${randomUUID().replaceAll("-", "")}`,
@@ -809,11 +827,15 @@ const server = http.createServer(async (request, response) => {
         });
 
         // Remember this request's options so the next warm process matches.
-        lastChatRequestTemplate = {
-            model: requestBody.model,
-            system: requestBody.system,
-            max_tokens: requestBody.max_tokens,
-        };
+        // Only streaming requests (the main voice flow) set the template —
+        // non-streaming locator calls must not retarget the warm process.
+        if (requestBody.stream === true) {
+            lastChatRequestTemplate = {
+                model: requestBody.model,
+                system: requestBody.system,
+                max_tokens: requestBody.max_tokens,
+            };
+        }
 
         try {
             if (requestBody.stream === true) {

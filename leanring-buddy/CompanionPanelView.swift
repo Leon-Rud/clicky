@@ -38,6 +38,9 @@ struct CompanionPanelView: View {
 
                 voicePickerRow
                     .padding(.horizontal, 16)
+
+                allowActionsToggleRow
+                    .padding(.horizontal, 16)
             }
 
             if !companionManager.allPermissionsGranted {
@@ -769,6 +772,38 @@ struct CompanionPanelView: View {
         }
         .buttonStyle(.plain)
         .pointerCursor()
+    }
+
+    // MARK: - Allow Actions Toggle
+
+    /// Lets the user allow or forbid real mouse clicks. When on, Claude can
+    /// click UI elements when verbally asked ("click the save button"). When
+    /// off, click requests degrade to pointing at the element instead.
+    private var allowActionsToggleRow: some View {
+        HStack {
+            HStack(spacing: 8) {
+                Image(systemName: "cursorarrow.click")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(DS.Colors.textTertiary)
+                    .frame(width: 16)
+
+                Text("Allow actions")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(DS.Colors.textSecondary)
+            }
+
+            Spacer()
+
+            Toggle("", isOn: Binding(
+                get: { companionManager.allowClickActions },
+                set: { companionManager.setAllowClickActions($0) }
+            ))
+            .toggleStyle(.switch)
+            .labelsHidden()
+            .tint(DS.Colors.accent)
+            .scaleEffect(0.8)
+        }
+        .padding(.vertical, 4)
     }
 
     // MARK: - DM Farza Button
