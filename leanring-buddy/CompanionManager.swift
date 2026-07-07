@@ -762,7 +762,7 @@ final class CompanionManager: ObservableObject {
                     } catch {
                         ClickyAnalytics.trackTTSError(error: error.localizedDescription)
                         print("⚠️ TTS error: \(error)")
-                        speakCreditsErrorFallback()
+                        speakResponseErrorFallback(for: error)
                     }
                 }
             } catch is CancellationError {
@@ -770,7 +770,7 @@ final class CompanionManager: ObservableObject {
             } catch {
                 ClickyAnalytics.trackResponseError(error: error.localizedDescription)
                 print("⚠️ Companion response error: \(error)")
-                speakCreditsErrorFallback()
+                speakResponseErrorFallback(for: error)
             }
 
             if !Task.isCancelled {
@@ -828,17 +828,27 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    /// Speaks a hardcoded error message using macOS system TTS when the
-    /// Anthropic request fails. Uses NSSpeechSynthesizer so it works even
-    /// when the primary TTS path is unavailable.
-    private func speakCreditsErrorFallback() {
+    /// Speaks a short error message using macOS system TTS when the response
+    /// pipeline fails. Uses NSSpeechSynthesizer so it works even when the
+    /// primary TTS path is unavailable. The message is chosen from the error:
+    /// timeout, bridge unreachable, missing API key, or a generic model error —
+    /// kept short because it's spoken aloud.
+    private func speakResponseErrorFallback(for responseError: Error) {
         let utterance: String
-        if claudeBackendMode == .subscription {
-            utterance = "Something went wrong talking to Claude. Make sure the local bridge is running."
-        } else if hasAnthropicAPIKey {
-            utterance = "Something went wrong talking to Claude. Check that your API key is valid and has credits."
+        let errorCode = (responseError as NSError).code
+        let errorDescription = (responseError as NSError).localizedDescription
+
+        if errorCode == URLError.timedOut.rawValue {
+            utterance = "That took too long, try again."
+        } else if claudeBackendMode == .subscription
+                    && (errorDescription.contains("local bridge") || errorDescription.contains("127.0.0.1:8377")) {
+            // ClaudeAPI maps connection failures to a "local bridge" guidance
+            // error in subscription mode (see mapTransportErrorToBridgeGuidanceIfNeeded).
+            utterance = "The local bridge isn't running."
+        } else if claudeBackendMode == .apiKey && !hasAnthropicAPIKey {
+            utterance = "I need an Anthropic API key. Open the Clicky panel in the menu bar and paste one in."
         } else {
-            utterance = "I need an Anthropic API key to work. Open the Clicky panel in the menu bar and paste one in."
+            utterance = "Claude couldn't process that."
         }
         let synthesizer = NSSpeechSynthesizer()
         synthesizer.startSpeaking(utterance)

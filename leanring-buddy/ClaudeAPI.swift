@@ -135,8 +135,11 @@ class ClaudeAPI {
             return transportError
         }
 
+        // .timedOut is deliberately NOT in this set: a timeout means the bridge
+        // WAS reachable but the response took too long, and CompanionManager
+        // speaks a different error message for that case.
         let connectionFailureCodes: Set<URLError.Code> = [
-            .cannotConnectToHost, .cannotFindHost, .networkConnectionLost, .timedOut
+            .cannotConnectToHost, .cannotFindHost, .networkConnectionLost
         ]
         guard connectionFailureCodes.contains(urlError.code) else {
             return transportError
@@ -307,6 +310,20 @@ class ClaudeAPI {
                   let eventPayload = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
                   let eventType = eventPayload["type"] as? String else {
                 continue
+            }
+
+            // The API (and the local bridge) surface mid-stream failures as an
+            // SSE `error` event. Throw a descriptive error instead of silently
+            // ending the stream with whatever partial text has accumulated.
+            if eventType == "error" {
+                let errorDetails = eventPayload["error"] as? [String: Any]
+                let errorTypeName = errorDetails?["type"] as? String ?? "unknown_error"
+                let errorMessage = errorDetails?["message"] as? String ?? "The stream reported an error with no message"
+                throw NSError(
+                    domain: "ClaudeAPI",
+                    code: -2,
+                    userInfo: [NSLocalizedDescriptionKey: "Streaming error (\(errorTypeName)): \(errorMessage)"]
+                )
             }
 
             // We care about content_block_delta events that contain text chunks
