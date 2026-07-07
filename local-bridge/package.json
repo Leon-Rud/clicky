@@ -1,0 +1,17 @@
+{
+  "name": "clicky-local-bridge",
+  "version": "1.0.0",
+  "description": "Local bridge that exposes an Anthropic-Messages-compatible SSE endpoint backed by the Claude Agent SDK, so Clicky runs on a Claude subscription instead of a pay-per-token API key.",
+  "type": "module",
+  "private": true,
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.1.0"
+  }
+}
