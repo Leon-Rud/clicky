@@ -81,14 +81,20 @@ enum CompanionScreenCaptureUtility {
             let filter = SCContentFilter(display: display, excludingWindows: ownAppWindows)
 
             let configuration = SCStreamConfiguration()
-            let maxDimension = 1280
+            // The Anthropic API silently downscales any image whose long edge
+            // exceeds 1568 pixels, which would shift the model's coordinate
+            // space away from the labeled dimensions and skew every [POINT:...]
+            // and [CLICK:...] coordinate. Capturing at a long edge of exactly
+            // 1568 keeps the model's coordinates 1:1 with the image it sees
+            // while sending the highest resolution the API accepts unmodified.
+            let maxLongEdgeInPixels = 1568
             let aspectRatio = CGFloat(display.width) / CGFloat(display.height)
             if display.width >= display.height {
-                configuration.width = maxDimension
-                configuration.height = Int(CGFloat(maxDimension) / aspectRatio)
+                configuration.width = maxLongEdgeInPixels
+                configuration.height = Int(CGFloat(maxLongEdgeInPixels) / aspectRatio)
             } else {
-                configuration.height = maxDimension
-                configuration.width = Int(CGFloat(maxDimension) * aspectRatio)
+                configuration.height = maxLongEdgeInPixels
+                configuration.width = Int(CGFloat(maxLongEdgeInPixels) * aspectRatio)
             }
 
             let cgImage = try await SCScreenshotManager.captureImage(
