@@ -10,7 +10,6 @@
 import AVFoundation
 import Combine
 import Foundation
-import PostHog
 import ScreenCaptureKit
 import SwiftUI
 
@@ -199,18 +198,13 @@ final class CompanionManager: ObservableObject {
     /// Whether the user has submitted their email during onboarding.
     @Published var hasSubmittedEmail: Bool = UserDefaults.standard.bool(forKey: "hasSubmittedEmail")
 
-    /// Submits the user's email to FormSpark and identifies them in PostHog.
+    /// Submits the user's email to FormSpark.
     func submitEmail(_ email: String) {
         let trimmedEmail = email.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedEmail.isEmpty else { return }
 
         hasSubmittedEmail = true
         UserDefaults.standard.set(true, forKey: "hasSubmittedEmail")
-
-        // Identify user in PostHog
-        PostHogSDK.shared.identify(trimmedEmail, userProperties: [
-            "email": trimmedEmail
-        ])
 
         // Submit to FormSpark
         Task {
