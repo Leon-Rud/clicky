@@ -5,6 +5,35 @@
 
 import Foundation
 
+/// Which backend Clicky uses to reach Claude.
+enum ClaudeBackendMode: String {
+    /// Route requests through the local bridge server (`local-bridge/` in the
+    /// repo), which talks to Claude via the Claude Agent SDK using the user's
+    /// Claude subscription. No API key and no per-token billing.
+    case subscription
+    /// Call https://api.anthropic.com/v1/messages directly with a
+    /// user-supplied Console API key (pay-per-token).
+    case apiKey
+}
+
+/// Reads and writes the user's chosen Claude backend mode. Persisted to
+/// UserDefaults under "ClaudeBackendMode"; defaults to `.subscription`.
+enum ClaudeBackendModeStore {
+    static let userDefaultsKey = "ClaudeBackendMode"
+
+    static var mode: ClaudeBackendMode {
+        guard let storedRawValue = UserDefaults.standard.string(forKey: userDefaultsKey),
+              let storedMode = ClaudeBackendMode(rawValue: storedRawValue) else {
+            return .subscription
+        }
+        return storedMode
+    }
+
+    static func setMode(_ mode: ClaudeBackendMode) {
+        UserDefaults.standard.set(mode.rawValue, forKey: userDefaultsKey)
+    }
+}
+
 /// Reads and writes the user-supplied Anthropic API key. The key is entered
 /// in the menu bar panel and persisted to UserDefaults — no proxy server is
 /// involved, the app talks to api.anthropic.com directly.
@@ -30,16 +59,23 @@ class ClaudeAPI {
     private static let tlsWarmupLock = NSLock()
     private static var hasStartedTLSWarmup = false
 
-    /// The Anthropic Messages API endpoint.
+    /// The Anthropic Messages API endpoint (used in `.apiKey` mode).
     private static let anthropicMessagesURLString = "https://api.anthropic.com/v1/messages"
     private static let anthropicAPIVersion = "2023-06-01"
 
-    private let apiURL: URL
+    /// The local bridge server's chat endpoint (used in `.subscription` mode).
+    /// The bridge (`local-bridge/` in the repo) forwards requests to the
+    /// Claude Agent SDK, which authenticates via the user's Claude Code login.
+    private static let localBridgeChatURLString = "http://127.0.0.1:8377/chat"
+
+    private let anthropicMessagesURL: URL
+    private let localBridgeChatURL: URL
     var model: String
     private let session: URLSession
 
     init(model: String = "claude-sonnet-4-6") {
-        self.apiURL = URL(string: Self.anthropicMessagesURLString)!
+        self.anthropicMessagesURL = URL(string: Self.anthropicMessagesURLString)!
+        self.localBridgeChatURL = URL(string: Self.localBridgeChatURLString)!
         self.model = model
 
         // Use .default instead of .ephemeral so TLS session tickets are cached.
@@ -61,21 +97,56 @@ class ClaudeAPI {
     }
 
     private func makeAPIRequest() throws -> URLRequest {
-        guard let apiKey = AnthropicAPIKeyStore.apiKey else {
-            throw NSError(
-                domain: "ClaudeAPI",
-                code: 401,
-                userInfo: [NSLocalizedDescriptionKey: "No Anthropic API key set. Open the Clicky menu bar panel and paste your key from console.anthropic.com."]
-            )
+        switch ClaudeBackendModeStore.mode {
+        case .subscription:
+            // The local bridge authenticates via the Claude Agent SDK on the
+            // user's machine, so the request carries no auth headers at all.
+            var request = URLRequest(url: localBridgeChatURL)
+            request.httpMethod = "POST"
+            request.timeoutInterval = 120
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            return request
+
+        case .apiKey:
+            guard let apiKey = AnthropicAPIKeyStore.apiKey else {
+                throw NSError(
+                    domain: "ClaudeAPI",
+                    code: 401,
+                    userInfo: [NSLocalizedDescriptionKey: "No Anthropic API key set. Open the Clicky menu bar panel and paste your key from console.anthropic.com."]
+                )
+            }
+
+            var request = URLRequest(url: anthropicMessagesURL)
+            request.httpMethod = "POST"
+            request.timeoutInterval = 120
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+            request.setValue(Self.anthropicAPIVersion, forHTTPHeaderField: "anthropic-version")
+            return request
+        }
+    }
+
+    /// Converts a low-level connection failure into an actionable error when
+    /// the app is in subscription mode and the local bridge isn't running.
+    /// All other errors are passed through unchanged.
+    private func mapTransportErrorToBridgeGuidanceIfNeeded(_ transportError: Error) -> Error {
+        guard ClaudeBackendModeStore.mode == .subscription,
+              let urlError = transportError as? URLError else {
+            return transportError
         }
 
-        var request = URLRequest(url: apiURL)
-        request.httpMethod = "POST"
-        request.timeoutInterval = 120
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
-        request.setValue(Self.anthropicAPIVersion, forHTTPHeaderField: "anthropic-version")
-        return request
+        let connectionFailureCodes: Set<URLError.Code> = [
+            .cannotConnectToHost, .cannotFindHost, .networkConnectionLost, .timedOut
+        ]
+        guard connectionFailureCodes.contains(urlError.code) else {
+            return transportError
+        }
+
+        return NSError(
+            domain: "ClaudeAPI",
+            code: urlError.errorCode,
+            userInfo: [NSLocalizedDescriptionKey: "Can't reach the local bridge at 127.0.0.1:8377. Start the local bridge: cd local-bridge && npm start"]
+        )
     }
 
     /// Detects the MIME type of image data by inspecting the first bytes.
@@ -97,7 +168,11 @@ class ClaudeAPI {
 
     /// Sends a no-op HEAD request to the API host to establish and cache a TLS session.
     /// Failures are silently ignored — this is purely an optimization.
+    /// Only relevant in `.apiKey` mode — the local bridge is plain HTTP on loopback,
+    /// so there's no TLS handshake to warm up in `.subscription` mode.
     private func warmUpTLSConnectionIfNeeded() {
+        guard ClaudeBackendModeStore.mode == .apiKey else { return }
+
         Self.tlsWarmupLock.lock()
         let shouldStartTLSWarmup = !Self.hasStartedTLSWarmup
         if shouldStartTLSWarmup {
@@ -107,7 +182,7 @@ class ClaudeAPI {
 
         guard shouldStartTLSWarmup else { return }
 
-        guard var warmupURLComponents = URLComponents(url: apiURL, resolvingAgainstBaseURL: false) else {
+        guard var warmupURLComponents = URLComponents(url: anthropicMessagesURL, resolvingAgainstBaseURL: false) else {
             return
         }
 
@@ -187,7 +262,13 @@ class ClaudeAPI {
         print("🌐 Claude streaming request: \(String(format: "%.1f", payloadMB))MB, \(images.count) image(s)")
 
         // Use bytes streaming for SSE (Server-Sent Events)
-        let (byteStream, response) = try await session.bytes(for: request)
+        let byteStream: URLSession.AsyncBytes
+        let response: URLResponse
+        do {
+            (byteStream, response) = try await session.bytes(for: request)
+        } catch {
+            throw mapTransportErrorToBridgeGuidanceIfNeeded(error)
+        }
 
         guard let httpResponse = response as? HTTPURLResponse else {
             throw NSError(
@@ -296,7 +377,13 @@ class ClaudeAPI {
         let payloadMB = Double(bodyData.count) / 1_048_576.0
         print("🌐 Claude request: \(String(format: "%.1f", payloadMB))MB, \(images.count) image(s)")
 
-        let (data, response) = try await session.data(for: request)
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await session.data(for: request)
+        } catch {
+            throw mapTransportErrorToBridgeGuidanceIfNeeded(error)
+        }
 
         guard let httpResponse = response as? HTTPURLResponse,
               (200...299).contains(httpResponse.statusCode) else {

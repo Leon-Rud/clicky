@@ -4,6 +4,13 @@
 <dict>
 	<key>LSUIElement</key>
 	<true/>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<!-- Permit plain-HTTP requests to the local bridge on 127.0.0.1:8377
+		     (subscription mode). All other traffic still requires HTTPS. -->
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
 	<key>SUFeedURL</key>
 	<string>https://raw.githubusercontent.com/julianjear/makesomething-mac-app/main/appcast.xml</string>
 	<key>SUPublicEDKey</key>

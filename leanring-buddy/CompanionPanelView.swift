@@ -25,7 +25,7 @@ struct CompanionPanelView: View {
                 .padding(.top, 16)
                 .padding(.horizontal, 16)
 
-            apiKeySection
+            claudeAccessSection
                 .padding(.top, 12)
                 .padding(.horizontal, 16)
 
@@ -183,46 +183,75 @@ struct CompanionPanelView: View {
         }
     }
 
-    // MARK: - Anthropic API Key
+    // MARK: - Claude Access
 
-    /// Field for the user's Anthropic API key. The app calls the Anthropic
-    /// API directly, so this is the only credential Clicky needs.
-    private var apiKeySection: some View {
+    /// Lets the user pick how Clicky reaches Claude: through the local
+    /// subscription bridge (default — uses their Claude plan via the Claude
+    /// Agent SDK, no API key) or directly with an Anthropic API key. The
+    /// SecureField for the key only appears in API-key mode.
+    private var claudeAccessSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
-                Text("ANTHROPIC API KEY")
+                Text("CLAUDE ACCESS")
                     .font(.system(size: 10, weight: .semibold, design: .rounded))
                     .foregroundColor(DS.Colors.textTertiary)
 
                 Spacer()
 
-                if !companionManager.hasAnthropicAPIKey {
-                    Text("Required")
+                if companionManager.claudeBackendMode == .apiKey && !companionManager.hasAnthropicAPIKey {
+                    Text("Key required")
                         .font(.system(size: 10, weight: .medium))
                         .foregroundColor(Color(red: 0.9, green: 0.4, blue: 0.4))
                 }
             }
 
-            SecureField("sk-ant-...", text: Binding(
-                get: { companionManager.anthropicAPIKey },
-                set: { companionManager.setAnthropicAPIKey($0) }
-            ))
-            .textFieldStyle(.plain)
-            .font(.system(size: 12))
-            .foregroundColor(DS.Colors.textPrimary)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            .background(
-                RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
-                    .fill(Color.white.opacity(0.08))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
-                    .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
-            )
+            Picker("Claude access mode", selection: Binding(
+                get: { companionManager.claudeBackendMode },
+                set: { companionManager.setClaudeBackendMode($0) }
+            )) {
+                Text("Claude subscription").tag(ClaudeBackendMode.subscription)
+                Text("API key").tag(ClaudeBackendMode.apiKey)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            // Segmented controls don't get a pointer cursor automatically —
+            // make the segments read as clickable, matching the app's rule
+            // that every interactive element shows a pointer on hover.
+            .onHover { isHovering in
+                if isHovering {
+                    NSCursor.pointingHand.push()
+                } else {
+                    NSCursor.pop()
+                }
+            }
 
-            if !companionManager.hasAnthropicAPIKey {
-                Text("Paste a key from console.anthropic.com — Clicky talks to Claude directly.")
+            if companionManager.claudeBackendMode == .apiKey {
+                SecureField("sk-ant-...", text: Binding(
+                    get: { companionManager.anthropicAPIKey },
+                    set: { companionManager.setAnthropicAPIKey($0) }
+                ))
+                .textFieldStyle(.plain)
+                .font(.system(size: 12))
+                .foregroundColor(DS.Colors.textPrimary)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(
+                    RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
+                        .fill(Color.white.opacity(0.08))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
+                        .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
+                )
+
+                if !companionManager.hasAnthropicAPIKey {
+                    Text("Paste a key from console.anthropic.com — Clicky talks to Claude directly.")
+                        .font(.system(size: 10))
+                        .foregroundColor(DS.Colors.textTertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            } else {
+                Text("Requires the local bridge running — see local-bridge/README.")
                     .font(.system(size: 10))
                     .foregroundColor(DS.Colors.textTertiary)
                     .fixedSize(horizontal: false, vertical: true)

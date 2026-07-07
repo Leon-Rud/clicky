@@ -128,6 +128,16 @@ final class CompanionManager: ObservableObject {
         AnthropicAPIKeyStore.setAPIKey(apiKey)
     }
 
+    /// How the app reaches Claude: the local subscription bridge (default) or
+    /// a direct Anthropic API key. Persisted to UserDefaults ("ClaudeBackendMode")
+    /// and read by ClaudeAPI on each request.
+    @Published var claudeBackendMode: ClaudeBackendMode = ClaudeBackendModeStore.mode
+
+    func setClaudeBackendMode(_ claudeBackendMode: ClaudeBackendMode) {
+        self.claudeBackendMode = claudeBackendMode
+        ClaudeBackendModeStore.setMode(claudeBackendMode)
+    }
+
     /// User preference for whether the Clicky cursor should be shown.
     /// When toggled off, the overlay is hidden and push-to-talk is disabled.
     /// Persisted to UserDefaults so the choice survives app restarts.
@@ -771,9 +781,14 @@ final class CompanionManager: ObservableObject {
     /// Anthropic request fails. Uses NSSpeechSynthesizer so it works even
     /// when the primary TTS path is unavailable.
     private func speakCreditsErrorFallback() {
-        let utterance = hasAnthropicAPIKey
-            ? "Something went wrong talking to Claude. Check that your API key is valid and has credits."
-            : "I need an Anthropic API key to work. Open the Clicky panel in the menu bar and paste one in."
+        let utterance: String
+        if claudeBackendMode == .subscription {
+            utterance = "Something went wrong talking to Claude. Make sure the local bridge is running."
+        } else if hasAnthropicAPIKey {
+            utterance = "Something went wrong talking to Claude. Check that your API key is valid and has credits."
+        } else {
+            utterance = "I need an Anthropic API key to work. Open the Clicky panel in the menu bar and paste one in."
+        }
         let synthesizer = NSSpeechSynthesizer()
         synthesizer.startSpeaking(utterance)
         voiceState = .responding
