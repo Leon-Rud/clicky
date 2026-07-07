@@ -54,6 +54,11 @@ const MAX_REQUEST_BODY_BYTES = 100 * 1024 * 1024;
 // long-idle child processes may have lost auth/network state.
 const WARM_QUERY_MAX_AGE_MS = 10 * 60 * 1000;
 
+// Only the most recent conversation turns are folded into the prompt. Older
+// turns add prompt tokens and latency without helping a voice Q&A about the
+// current screen. 12 messages = 6 user/assistant turn pairs.
+const MAX_FOLDED_HISTORY_MESSAGES = 12;
+
 // MARK: - Logging
 
 let nextRequestLogNumber = 1;
@@ -160,6 +165,23 @@ function systemPromptRequestsPointing(systemPromptText) {
     return systemPromptText.includes("[POINT:");
 }
 
+// MARK: - Voice response style
+
+/// Appended AFTER the app's own system prompt (never replacing it). Clicky
+/// speaks every response aloud via ElevenLabs TTS, so response length equals
+/// listening time — short plain-prose answers are the default. The coordinate
+/// tag carve-out keeps this from overriding the [POINT:...] instructions: the
+/// tag is stripped before TTS by the app, so it is not "spoken text".
+const VOICE_RESPONSE_STYLE_INSTRUCTION =
+    "\n\n<voice_response_style>\n" +
+    "Your responses are spoken aloud to the user via text-to-speech, so response length equals listening time. " +
+    "Default to 1-3 short conversational sentences. " +
+    "Never use markdown: no asterisks, bullet lists, numbered lists, headings, or code blocks — plain spoken prose only. " +
+    "Only give a longer answer when the user explicitly asks for detail. " +
+    "This style rule applies to the spoken text only and does not override any coordinate-tag instructions above: " +
+    "when those instructions require a [POINT:...] tag, you must still append it after the spoken text.\n" +
+    "</voice_response_style>";
+
 // MARK: - Agent SDK message + options construction
 
 /// Builds the single Agent SDK user message for this request.
@@ -171,12 +193,23 @@ function systemPromptRequestsPointing(systemPromptText) {
 /// model — so prior turns are folded into a leading transcript text block,
 /// and the latest user message's content blocks (base64 images included) are
 /// passed through unchanged.
-function buildAgentSDKUserMessage(anthropicMessages, systemPromptText) {
+function buildAgentSDKUserMessage(anthropicMessages, systemPromptText, requestLogId) {
     if (!Array.isArray(anthropicMessages) || anthropicMessages.length === 0) {
         throw new Error("Request body is missing a non-empty `messages` array");
     }
 
-    const priorMessages = anthropicMessages.slice(0, -1);
+    const allPriorMessages = anthropicMessages.slice(0, -1);
+    // Cap the folded history at the most recent turns — see
+    // MAX_FOLDED_HISTORY_MESSAGES for why older turns are dropped.
+    const historyWasTruncated = allPriorMessages.length > MAX_FOLDED_HISTORY_MESSAGES;
+    const priorMessages = historyWasTruncated
+        ? allPriorMessages.slice(-MAX_FOLDED_HISTORY_MESSAGES)
+        : allPriorMessages;
+    logBridgeEvent(
+        requestLogId ?? null,
+        `folded history: kept ${priorMessages.length} of ${allPriorMessages.length} prior messages` +
+            (historyWasTruncated ? " (older turns truncated)" : "")
+    );
     const latestMessage = anthropicMessages[anthropicMessages.length - 1];
 
     if (latestMessage.role !== "user") {
@@ -195,6 +228,9 @@ function buildAgentSDKUserMessage(anthropicMessages, systemPromptText) {
             const speakerLabel = message.role === "assistant" ? "Assistant" : "User";
             return `${speakerLabel}: ${renderMessageContentAsText(message.content)}`;
         });
+        if (historyWasTruncated) {
+            transcriptLines.unshift("(earlier conversation omitted)");
+        }
         userContentBlocks.push({
             type: "text",
             text:
@@ -240,7 +276,17 @@ function buildAgentSDKOptions(requestBody, abortController) {
         model: requestBody.model,
         // A plain string REPLACES Claude Code's preset system prompt entirely
         // (maximum fidelity) — this is NOT the `{type:'preset', append}` mode.
-        systemPrompt: extractSystemPromptText(requestBody.system),
+        // The voice-style instruction is appended AFTER the app's own prompt
+        // so it never displaces the app's instructions (including pointing).
+        systemPrompt: extractSystemPromptText(requestBody.system) + VOICE_RESPONSE_STYLE_INSTRUCTION,
+        // Pin extended thinking off. Clicky is a look-at-screenshot-and-answer
+        // app where time-to-first-token matters more than deep reasoning. In
+        // SDK mode Claude Code already defaults the thinking budget to 0, but
+        // an explicit 0 makes that deterministic — it also wins over the
+        // MAX_THINKING_TOKENS env var and the "ultrathink" keyword trigger
+        // that would otherwise enable a large thinking budget.
+        // (Verified against sdk.mjs: maxThinkingTokens → --max-thinking-tokens.)
+        maxThinkingTokens: 0,
         // `tools: []` disables every built-in tool (Read, Bash, WebSearch, ...).
         tools: [],
         allowedTools: [],
@@ -454,7 +500,8 @@ async function handleStreamingChat(response, requestBody, chatRequestContext) {
     // throws before headers are sent, so the client still gets a JSON error.
     const sdkUserMessage = buildAgentSDKUserMessage(
         requestBody.messages,
-        extractSystemPromptText(requestBody.system)
+        extractSystemPromptText(requestBody.system),
+        requestLogId
     );
 
     // Send headers + message_start IMMEDIATELY so the Swift client always has
@@ -585,7 +632,8 @@ async function handleNonStreamingChat(response, requestBody, chatRequestContext)
 
     const sdkUserMessage = buildAgentSDKUserMessage(
         requestBody.messages,
-        extractSystemPromptText(requestBody.system)
+        extractSystemPromptText(requestBody.system),
+        requestLogId
     );
 
     let accumulatedAssistantText = "";
