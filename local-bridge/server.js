@@ -160,6 +160,9 @@ const POINTING_REMINDER_TEXT =
     "open, or select something FOR them), use [CLICK:x,y:label] (or [CLICK:x,y:label:screenN]) instead of " +
     "POINT, and keep the spoken text to a brief confirmation like \"clicking the save button.\" " +
     "for informational questions always use POINT, and never emit both a POINT and a CLICK tag. " +
+    "if the user's request is an action that needs MULTIPLE steps to complete (several clicks, or " +
+    "clicking plus typing), speak a brief confirmation of the plan and end with [TASK] instead of a " +
+    "CLICK tag — the step-by-step agent loop takes it from there. " +
     "the tag must be the very last thing in your response, after all spoken text.\n" +
     "</pointing_reminder>";
 
@@ -167,6 +170,25 @@ const POINTING_REMINDER_TEXT =
 /// reminder is only injected for the pointing-enabled prompts.
 function systemPromptRequestsPointing(systemPromptText) {
     return systemPromptText.includes("[POINT:");
+}
+
+// MARK: - Agent step reminder
+
+/// Injected into the user turn for multi-step agent-task requests (system
+/// prompts carrying the <agent_step> marker — see CompanionManager.swift's
+/// agentStepSystemPrompt and runAgentTask). Restates the one-action-per-turn
+/// protocol, which the Claude Code harness otherwise dilutes.
+const AGENT_STEP_REMINDER_TEXT =
+    "<agent_step_reminder>\n" +
+    "reminder: respond with a tiny lowercase narration (two to six words) followed by EXACTLY ONE action tag " +
+    "as the very last thing in your response: [CLICK:x,y:label], [TYPE:text], [KEY:combo], [SCROLL:up], " +
+    "[SCROLL:down], [DONE:summary], or [FAIL:reason]. never two tags, never an action after the tag, " +
+    "no markdown. coordinates are pixels in the labeled screenshot's coordinate space, origin top-left.\n" +
+    "</agent_step_reminder>";
+
+/// Detects the multi-step agent loop's step requests.
+function systemPromptIsAgentStep(systemPromptText) {
+    return systemPromptText.includes("<agent_step>");
 }
 
 // MARK: - Voice response style
@@ -249,7 +271,10 @@ function buildAgentSDKUserMessage(anthropicMessages, systemPromptText, requestLo
 
     // Reinforce the [POINT:...] instructions inside the user turn — the
     // system prompt alone under-triggers pointing through the Agent SDK.
-    if (systemPromptRequestsPointing(systemPromptText)) {
+    // Agent-step requests get their own one-action-per-turn reminder instead.
+    if (systemPromptIsAgentStep(systemPromptText)) {
+        userContentBlocks.push({ type: "text", text: AGENT_STEP_REMINDER_TEXT });
+    } else if (systemPromptRequestsPointing(systemPromptText)) {
         userContentBlocks.push({ type: "text", text: POINTING_REMINDER_TEXT });
     }
 
@@ -279,8 +304,11 @@ function buildAgentSDKOptions(requestBody, abortController) {
     const systemPromptText = extractSystemPromptText(requestBody.system);
     // Locator requests (ElementLocationDetector.swift's precision coordinate
     // pass) demand a strict-JSON answer, so the spoken-voice style instruction
-    // must NOT be appended — it would push the model back to prose.
+    // must NOT be appended — it would push the model back to prose. Agent-step
+    // requests fully specify their own narration style, so the voice-style
+    // instruction is skipped for them too.
     const isLocatorRequest = systemPromptText.includes("<locator_request>");
+    const isAgentStepRequest = systemPromptIsAgentStep(systemPromptText);
 
     return {
         model: requestBody.model,
@@ -288,7 +316,7 @@ function buildAgentSDKOptions(requestBody, abortController) {
         // (maximum fidelity) — this is NOT the `{type:'preset', append}` mode.
         // The voice-style instruction is appended AFTER the app's own prompt
         // so it never displaces the app's instructions (including pointing).
-        systemPrompt: isLocatorRequest
+        systemPrompt: (isLocatorRequest || isAgentStepRequest)
             ? systemPromptText
             : systemPromptText + VOICE_RESPONSE_STYLE_INSTRUCTION,
         // Pin extended thinking off. Clicky is a look-at-screenshot-and-answer

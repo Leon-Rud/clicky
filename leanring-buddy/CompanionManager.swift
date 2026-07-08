@@ -742,6 +742,12 @@ final class CompanionManager: ObservableObject {
     - never emit both a POINT tag and a CLICK tag in the same response — exactly one tag, and it must be the very last thing in your response.
     - when you emit CLICK, keep the spoken text to a brief confirmation of the action, like "clicking the save button."
 
+    multi-step tasks:
+    if the user asks you to DO something that needs more than one action to complete — like "open safari and search for flights", "create a new note and write my shopping list in it", "reply to that email saying i'll be there" — do not try to cram it into a single CLICK. instead, speak a very brief confirmation of the plan (like "on it, opening safari and searching for flights") and end with [TASK] as your tag. clicky will then work through the task one step at a time, clicking and typing as needed.
+    strict TASK rules:
+    - [TASK] is only for explicit action requests that need multiple steps. questions are never TASK. a single simple click is still CLICK, not TASK.
+    - [TASK] takes no coordinates — it's exactly the literal text [TASK] as the very last thing in your response, and like the other tags it replaces POINT/CLICK (never emit two tags).
+
     examples:
     - user asks how to color grade in final cut: "you'll want to open the color inspector — it's right up in the top right area of the toolbar. click that and you'll get all the color wheels and curves. [POINT:1100,42:color inspector]"
     - user asks what html is: "html stands for hypertext markup language, it's basically the skeleton of every web page. curious how it connects to the css you're looking at? [POINT:none]"
@@ -750,6 +756,8 @@ final class CompanionManager: ObservableObject {
     - user says "click the save button": "clicking the save button. [CLICK:640,52:save button]"
     - user says "where's the save button?" (informational, so POINT not CLICK): "it's up in the top right of the toolbar. [POINT:640,52:save button]"
     - user says "open the file menu for me": "opening the file menu. [CLICK:85,11:file menu]"
+    - user says "open safari and go to gmail": "on it, opening safari and heading to gmail. [TASK]"
+    - user says "make a new note and title it groceries": "sure, making a new note called groceries. [TASK]"
     """
 
     // MARK: - AI Response Pipeline
@@ -800,6 +808,22 @@ final class CompanionManager: ObservableObject {
 
                 guard !Task.isCancelled else { return }
 
+                // Multi-step task hand-off: a trailing [TASK] tag means this
+                // request needs the step-by-step agent loop (multiple clicks,
+                // typing, key presses) rather than a single POINT/CLICK.
+                let agentTaskParseResult = Self.parseAgentTaskTag(from: fullResponseText)
+                if agentTaskParseResult.isAgentTask {
+                    await runAgentTask(
+                        taskGoal: transcript,
+                        acknowledgmentSpokenText: agentTaskParseResult.spokenText
+                    )
+                    if !Task.isCancelled {
+                        voiceState = .idle
+                        scheduleTransientHideIfNeeded()
+                    }
+                    return
+                }
+
                 // Parse the [POINT:...] / [CLICK:...] tag from Claude's response
                 let parseResult = Self.parsePointingCoordinates(from: fullResponseText)
                 let spokenText = parseResult.spokenText
@@ -849,27 +873,10 @@ final class CompanionManager: ObservableObject {
                     // Claude's coordinates are in the screenshot's pixel space
                     // (top-left origin, e.g. 1568x980). Scale to the display's
                     // point space (e.g. 1512x982), then convert to AppKit global coords.
-                    let screenshotWidth = CGFloat(targetScreenCapture.screenshotWidthInPixels)
-                    let screenshotHeight = CGFloat(targetScreenCapture.screenshotHeightInPixels)
-                    let displayWidth = CGFloat(targetScreenCapture.displayWidthInPoints)
-                    let displayHeight = CGFloat(targetScreenCapture.displayHeightInPoints)
                     let displayFrame = targetScreenCapture.displayFrame
-
-                    // Clamp to screenshot coordinate space
-                    let clampedX = max(0, min(pointCoordinate.x, screenshotWidth))
-                    let clampedY = max(0, min(pointCoordinate.y, screenshotHeight))
-
-                    // Scale from screenshot pixels to display points
-                    let displayLocalX = clampedX * (displayWidth / screenshotWidth)
-                    let displayLocalY = clampedY * (displayHeight / screenshotHeight)
-
-                    // Convert from top-left origin (screenshot) to bottom-left origin (AppKit)
-                    let appKitY = displayHeight - displayLocalY
-
-                    // Convert display-local coords to global screen coords
-                    let globalLocation = CGPoint(
-                        x: displayLocalX + displayFrame.origin.x,
-                        y: appKitY + displayFrame.origin.y
+                    let globalLocation = Self.mapScreenshotPixelCoordinateToGlobalAppKitPoint(
+                        pointCoordinate,
+                        on: targetScreenCapture
                     )
 
                     if shouldPerformClickAction {
@@ -1092,6 +1099,386 @@ final class CompanionManager: ObservableObject {
             screenNumber: screenNumber,
             isClickAction: isClickAction
         )
+    }
+
+    // MARK: - Multi-Step Agent Tasks
+
+    struct AgentTaskParseResult {
+        /// True when the response ended with a [TASK] tag — the request needs
+        /// the multi-step agent loop instead of a single POINT/CLICK.
+        let isAgentTask: Bool
+        /// The response text with the [TASK] tag removed — spoken as the
+        /// acknowledgment before the agent loop starts.
+        let spokenText: String
+    }
+
+    /// Detects a trailing [TASK] tag in Claude's response. Runs before
+    /// parsePointingCoordinates because a TASK response has no coordinates.
+    static func parseAgentTaskTag(from responseText: String) -> AgentTaskParseResult {
+        let pattern = #"\[TASK\]\s*$"#
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let match = regex.firstMatch(in: responseText, range: NSRange(responseText.startIndex..., in: responseText)),
+              let tagRange = Range(match.range, in: responseText) else {
+            return AgentTaskParseResult(isAgentTask: false, spokenText: responseText)
+        }
+        let spokenText = String(responseText[..<tagRange.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+        return AgentTaskParseResult(isAgentTask: true, spokenText: spokenText)
+    }
+
+    /// One action the agent loop can perform per step, parsed from the
+    /// action tag at the end of an agent-step response.
+    enum AgentStepAction {
+        case click(coordinate: CGPoint, elementLabel: String, screenNumber: Int?)
+        case typeText(String)
+        case pressKey(String)
+        case scroll(direction: AgentActionExecutor.ScrollDirection)
+        case done(summary: String)
+        case fail(reason: String)
+    }
+
+    struct AgentStepParseResult {
+        /// The response text with the action tag removed — spoken as the
+        /// step's narration ("opening spotlight").
+        let narrationText: String
+        /// The parsed action, or nil when the response had no valid tag.
+        let action: AgentStepAction?
+    }
+
+    /// Parses the single action tag at the end of an agent-step response:
+    /// [CLICK:x,y:label(:screenN)], [TYPE:text], [KEY:combo], [SCROLL:up|down],
+    /// [DONE:summary], or [FAIL:reason].
+    static func parseAgentStepAction(from responseText: String) -> AgentStepParseResult {
+        let pattern = #"\[(CLICK|TYPE|KEY|SCROLL|DONE|FAIL)(?::([\s\S]*?))?\]\s*$"#
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let match = regex.firstMatch(in: responseText, range: NSRange(responseText.startIndex..., in: responseText)),
+              let tagRange = Range(match.range, in: responseText),
+              let tagNameRange = Range(match.range(at: 1), in: responseText) else {
+            return AgentStepParseResult(
+                narrationText: responseText.trimmingCharacters(in: .whitespacesAndNewlines),
+                action: nil
+            )
+        }
+
+        let narrationText = String(responseText[..<tagRange.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let tagName = String(responseText[tagNameRange])
+        var tagPayload = ""
+        if let payloadRange = Range(match.range(at: 2), in: responseText) {
+            tagPayload = String(responseText[payloadRange])
+        }
+
+        switch tagName {
+        case "CLICK":
+            // Payload shape: "x,y:label" or "x,y:label:screenN"
+            let payloadParts = tagPayload.split(separator: ":", omittingEmptySubsequences: false).map(String.init)
+            guard let coordinatePart = payloadParts.first else {
+                return AgentStepParseResult(narrationText: narrationText, action: nil)
+            }
+            let coordinatePieces = coordinatePart.split(separator: ",")
+            guard coordinatePieces.count == 2,
+                  let x = Double(coordinatePieces[0].trimmingCharacters(in: .whitespaces)),
+                  let y = Double(coordinatePieces[1].trimmingCharacters(in: .whitespaces)) else {
+                return AgentStepParseResult(narrationText: narrationText, action: nil)
+            }
+            var elementLabel = "element"
+            if payloadParts.count >= 2 {
+                let labelCandidate = payloadParts[1].trimmingCharacters(in: .whitespaces)
+                if !labelCandidate.isEmpty { elementLabel = labelCandidate }
+            }
+            var screenNumber: Int? = nil
+            if payloadParts.count >= 3, payloadParts[2].hasPrefix("screen") {
+                screenNumber = Int(payloadParts[2].dropFirst("screen".count))
+            }
+            return AgentStepParseResult(
+                narrationText: narrationText,
+                action: .click(coordinate: CGPoint(x: x, y: y), elementLabel: elementLabel, screenNumber: screenNumber)
+            )
+        case "TYPE":
+            return AgentStepParseResult(narrationText: narrationText, action: .typeText(tagPayload))
+        case "KEY":
+            return AgentStepParseResult(
+                narrationText: narrationText,
+                action: .pressKey(tagPayload.trimmingCharacters(in: .whitespaces))
+            )
+        case "SCROLL":
+            let scrollDirection: AgentActionExecutor.ScrollDirection =
+                tagPayload.lowercased().hasPrefix("up") ? .up : .down
+            return AgentStepParseResult(narrationText: narrationText, action: .scroll(direction: scrollDirection))
+        case "DONE":
+            return AgentStepParseResult(
+                narrationText: narrationText,
+                action: .done(summary: tagPayload.trimmingCharacters(in: .whitespacesAndNewlines))
+            )
+        case "FAIL":
+            return AgentStepParseResult(
+                narrationText: narrationText,
+                action: .fail(reason: tagPayload.trimmingCharacters(in: .whitespacesAndNewlines))
+            )
+        default:
+            return AgentStepParseResult(narrationText: narrationText, action: nil)
+        }
+    }
+
+    /// System prompt for each step of the agent loop. The <agent_step> marker
+    /// tells the local bridge to skip the voice-style instruction and inject
+    /// the agent-step reminder instead of the pointing reminder.
+    private static let agentStepSystemPrompt = """
+    <agent_step>
+    you're clicky, operating the user's mac by hand to complete a task they asked for. each turn you see the current state of their screen(s), the task goal, and the steps already performed. decide the SINGLE next action that moves the task forward.
+
+    respond with a tiny spoken narration (two to six lowercase words, like "opening spotlight" or "typing the address") followed by exactly ONE action tag as the very last thing in your response.
+
+    action tags:
+    - [CLICK:x,y:label] — one left click on an element. x,y are integer pixel coordinates in the labeled screenshot's coordinate space, origin top-left, x rightward, y downward. label is a short 1-3 word element name. if the element is on a different screen than the cursor, use [CLICK:x,y:label:screenN] with N from the image label.
+    - [TYPE:the text to type] — types into whatever field currently has keyboard focus. click the field in an earlier step first if it isn't focused. never put square brackets inside the text.
+    - [KEY:combo] — presses a key or shortcut. plain keys: return, escape, tab, space, delete, up, down, left, right, pageup, pagedown. combos with cmd, shift, option, ctrl — like cmd+t or cmd+shift+n.
+    - [SCROLL:up] or [SCROLL:down] — scrolls the content in the middle of the screen.
+    - [DONE:short spoken wrap-up] — the goal is achieved (or already was). the wrap-up is spoken aloud, one friendly lowercase sentence.
+    - [FAIL:short spoken reason] — you cannot proceed (needed app missing, unexpected screen, login required). spoken aloud.
+
+    rules:
+    - exactly one action per turn. never chain two actions in one response.
+    - prefer reliable keyboard routes: cmd+space, typing an app name, then return is the best way to open any app. return submits searches and forms. cmd+t opens a browser tab, cmd+l focuses the address bar.
+    - before typing, make sure the target field has keyboard focus — click it first if unsure.
+    - look at the screenshots carefully. if your previous step didn't have the expected effect, recover — do the right thing now instead of repeating the same action.
+    - if the screen already shows the goal achieved, emit DONE instead of acting again.
+    - never click anything destructive — delete, send, buy, submit payment — unless the task goal explicitly asks for exactly that.
+    - the action tag must be the very last thing in your response, with nothing after it.
+    """
+
+    /// Converts a coordinate in a screen capture's screenshot pixel space
+    /// (top-left origin) into global AppKit screen coordinates (bottom-left
+    /// origin), scaling from screenshot pixels to display points. Used by both
+    /// the one-shot POINT/CLICK path and the multi-step agent loop.
+    private static func mapScreenshotPixelCoordinateToGlobalAppKitPoint(
+        _ screenshotPixelCoordinate: CGPoint,
+        on screenCapture: CompanionScreenCapture
+    ) -> CGPoint {
+        let screenshotWidth = CGFloat(screenCapture.screenshotWidthInPixels)
+        let screenshotHeight = CGFloat(screenCapture.screenshotHeightInPixels)
+        let displayWidth = CGFloat(screenCapture.displayWidthInPoints)
+        let displayHeight = CGFloat(screenCapture.displayHeightInPoints)
+        let displayFrame = screenCapture.displayFrame
+
+        // Clamp to screenshot coordinate space
+        let clampedX = max(0, min(screenshotPixelCoordinate.x, screenshotWidth))
+        let clampedY = max(0, min(screenshotPixelCoordinate.y, screenshotHeight))
+
+        // Scale from screenshot pixels to display points
+        let displayLocalX = clampedX * (displayWidth / screenshotWidth)
+        let displayLocalY = clampedY * (displayHeight / screenshotHeight)
+
+        // Convert from top-left origin (screenshot) to bottom-left origin (AppKit)
+        let appKitY = displayHeight - displayLocalY
+
+        return CGPoint(
+            x: displayLocalX + displayFrame.origin.x,
+            y: appKitY + displayFrame.origin.y
+        )
+    }
+
+    /// Works through a multi-step task one action at a time: capture the
+    /// screen, ask Claude for the single next action, narrate it aloud,
+    /// perform it, wait for the UI to settle, repeat — until [DONE], [FAIL],
+    /// or the step cap. Runs inside currentResponseTask, so pressing the
+    /// push-to-talk shortcut cancels the loop instantly (the press handler
+    /// cancels currentResponseTask).
+    private func runAgentTask(taskGoal: String, acknowledgmentSpokenText: String) async {
+        // The agent loop clicks and types on the user's machine, so it is
+        // gated behind the same "Allow actions" toggle as single clicks.
+        guard allowClickActions else {
+            let actionsDisabledMessage = "i'd love to, but actions are switched off. flip on allow actions in my menu bar panel and ask me again."
+            try? await speakResponseText(actionsDisabledMessage)
+            conversationHistory.append((userTranscript: taskGoal, assistantResponse: actionsDisabledMessage))
+            return
+        }
+
+        if !acknowledgmentSpokenText.isEmpty {
+            // speakResponseText returns once audio starts playing, so the
+            // first step's screenshot happens while the acknowledgment plays.
+            try? await speakResponseText(acknowledgmentSpokenText)
+        }
+
+        let maximumAgentStepCount = 10
+        var completedStepDescriptions: [String] = []
+        var finalOutcomeSpokenText: String? = nil
+
+        agentLoop: for _ in 1...maximumAgentStepCount {
+            guard !Task.isCancelled else { return }
+            voiceState = .processing
+
+            let stepResponseText: String
+            let screenCaptures: [CompanionScreenCapture]
+            do {
+                screenCaptures = try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
+                guard !Task.isCancelled else { return }
+
+                let labeledImages = screenCaptures.map { capture in
+                    let dimensionInfo = " (image dimensions: \(capture.screenshotWidthInPixels)x\(capture.screenshotHeightInPixels) pixels)"
+                    return (data: capture.imageData, label: capture.label + dimensionInfo)
+                }
+
+                let stepsPerformedText = completedStepDescriptions.isEmpty
+                    ? "(none yet — this is the first step)"
+                    : completedStepDescriptions.enumerated()
+                        .map { "\($0.offset + 1). \($0.element)" }
+                        .joined(separator: "\n")
+
+                let stepUserPrompt = """
+                <task_goal>\(taskGoal)</task_goal>
+                <steps_already_performed>
+                \(stepsPerformedText)
+                </steps_already_performed>
+                the screenshots show the CURRENT state of the screen(s), after the steps above. decide the single next action. if the goal is already achieved, emit [DONE:...].
+                """
+
+                (stepResponseText, _) = try await claudeAPI.analyzeImage(
+                    images: labeledImages,
+                    systemPrompt: Self.agentStepSystemPrompt,
+                    userPrompt: stepUserPrompt
+                )
+            } catch is CancellationError {
+                return
+            } catch {
+                print("⚠️ Agent task step error: \(error)")
+                speakResponseErrorFallback(for: error)
+                return
+            }
+            guard !Task.isCancelled else { return }
+
+            let stepParseResult = Self.parseAgentStepAction(from: stepResponseText)
+            guard let stepAction = stepParseResult.action else {
+                // The model broke protocol (no action tag). Speak whatever it
+                // said and stop rather than guessing at an action.
+                finalOutcomeSpokenText = stepParseResult.narrationText.isEmpty
+                    ? "i lost track of the next step, so i stopped. check the screen and ask me to continue."
+                    : stepParseResult.narrationText
+                break agentLoop
+            }
+
+            switch stepAction {
+            case .done(let taskSummary):
+                finalOutcomeSpokenText = taskSummary.isEmpty ? "all done." : taskSummary
+                break agentLoop
+
+            case .fail(let failureReason):
+                finalOutcomeSpokenText = failureReason.isEmpty ? "i couldn't finish that task." : failureReason
+                break agentLoop
+
+            case .click(var clickCoordinate, let elementLabel, let screenNumber):
+                if !stepParseResult.narrationText.isEmpty {
+                    try? await speakResponseText(stepParseResult.narrationText)
+                }
+
+                let targetScreenCapture: CompanionScreenCapture? = {
+                    if let screenNumber, screenNumber >= 1 && screenNumber <= screenCaptures.count {
+                        return screenCaptures[screenNumber - 1]
+                    }
+                    return screenCaptures.first(where: { $0.isCursorScreen })
+                }()
+                guard let targetScreenCapture else {
+                    finalOutcomeSpokenText = "i couldn't work out which screen to click on, so i stopped."
+                    break agentLoop
+                }
+
+                // Precision second pass — a real click must be accurate.
+                // Subscription mode only: the locator talks to the local bridge.
+                if claudeBackendMode == .subscription {
+                    if let refinedCoordinate = await elementLocationDetector.refineElementCoordinate(
+                        screenshotData: targetScreenCapture.imageData,
+                        screenshotWidthInPixels: targetScreenCapture.screenshotWidthInPixels,
+                        screenshotHeightInPixels: targetScreenCapture.screenshotHeightInPixels,
+                        elementLabel: elementLabel,
+                        initialCoordinate: clickCoordinate
+                    ) {
+                        clickCoordinate = refinedCoordinate
+                    }
+                    guard !Task.isCancelled else { return }
+                }
+
+                let globalClickLocation = Self.mapScreenshotPixelCoordinateToGlobalAppKitPoint(
+                    clickCoordinate,
+                    on: targetScreenCapture
+                )
+                // Safety: never synthesize an off-screen click.
+                let clickTargetIsOnAScreen = NSScreen.screens.contains { screen in
+                    screen.frame.contains(globalClickLocation)
+                }
+                guard clickTargetIsOnAScreen else {
+                    finalOutcomeSpokenText = "the next click would have landed off screen, so i stopped to be safe."
+                    break agentLoop
+                }
+
+                // Fly the overlay cursor to the target so the user sees where
+                // the click is about to land, then perform the real click.
+                voiceState = .idle
+                detectedElementScreenLocation = globalClickLocation
+                detectedElementDisplayFrame = targetScreenCapture.displayFrame
+                do { try await Task.sleep(nanoseconds: 1_200_000_000) } catch { return }
+                performSingleLeftClick(atGlobalAppKitPoint: globalClickLocation, elementLabel: elementLabel)
+                completedStepDescriptions.append("clicked \(elementLabel)")
+
+            case .typeText(let textToType):
+                if !stepParseResult.narrationText.isEmpty {
+                    try? await speakResponseText(stepParseResult.narrationText)
+                }
+                AgentActionExecutor.typeText(textToType)
+                completedStepDescriptions.append("typed \"\(textToType)\"")
+
+            case .pressKey(let keyComboDescription):
+                if !stepParseResult.narrationText.isEmpty {
+                    try? await speakResponseText(stepParseResult.narrationText)
+                }
+                if AgentActionExecutor.pressKeyCombo(keyComboDescription) {
+                    completedStepDescriptions.append("pressed \(keyComboDescription)")
+                } else {
+                    completedStepDescriptions.append("tried to press \(keyComboDescription) but that key isn't supported")
+                }
+
+            case .scroll(let scrollDirection):
+                if !stepParseResult.narrationText.isEmpty {
+                    try? await speakResponseText(stepParseResult.narrationText)
+                }
+                // Scroll events land on the window under the pointer, so aim
+                // at the center of the cursor's screen.
+                let scrollTargetScreenFrame = (screenCaptures.first(where: { $0.isCursorScreen }) ?? screenCaptures.first)?.displayFrame
+                    ?? NSScreen.screens.first?.frame
+                    ?? .zero
+                if let primaryScreen = NSScreen.screens.first {
+                    let scrollCenterInCGEventCoordinates = CGPoint(
+                        x: scrollTargetScreenFrame.midX,
+                        y: primaryScreen.frame.maxY - scrollTargetScreenFrame.midY
+                    )
+                    AgentActionExecutor.scroll(
+                        atGlobalCGEventPoint: scrollCenterInCGEventCoordinates,
+                        direction: scrollDirection
+                    )
+                }
+                completedStepDescriptions.append("scrolled \(scrollDirection == .up ? "up" : "down")")
+            }
+
+            // Let the UI settle before the next screenshot so the model sees
+            // the effect of the action it just took.
+            do { try await Task.sleep(nanoseconds: 1_000_000_000) } catch { return }
+        }
+
+        let outcomeSpokenText = finalOutcomeSpokenText
+            ?? "i've done \(maximumAgentStepCount) steps and the task isn't finished yet. take a look at where things are and tell me how to continue."
+
+        // Save the whole task as one exchange so follow-up questions have context.
+        conversationHistory.append((
+            userTranscript: taskGoal,
+            assistantResponse: acknowledgmentSpokenText.isEmpty
+                ? outcomeSpokenText
+                : acknowledgmentSpokenText + " " + outcomeSpokenText
+        ))
+        if conversationHistory.count > 10 {
+            conversationHistory.removeFirst(conversationHistory.count - 10)
+        }
+
+        if !Task.isCancelled {
+            try? await speakResponseText(outcomeSpokenText)
+            voiceState = .responding
+        }
     }
 
     // MARK: - Onboarding Video
